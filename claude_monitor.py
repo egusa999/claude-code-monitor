@@ -42,7 +42,8 @@ CONTEXT_TOKEN_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_TOKEN_LIMIT", "1000000"
 WORKING_THRESHOLD_SEC = 6.0         # この秒数以内にトランスクリプト更新があれば「作業中」
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 BLINK_INTERVAL_MS = 500             # 赤ランプの点滅間隔
-TRANSCRIPT_TAIL_BYTES = 65536       # トランスクリプト末尾の読み取りサイズ
+TRANSCRIPT_TAIL_BYTES = 65536        # トランスクリプト末尾読み取りの初期サイズ
+TRANSCRIPT_MAX_SCAN_BYTES = 8 * 1024 * 1024  # 見つからない場合に拡大する上限(8MB)
 
 # 配色(添付スクリーンショットの "Claude Usage" ウィンドウに寄せたダークテーマ)
 COLOR_BG = "#171a26"
@@ -73,6 +74,11 @@ class SessionInfo:
     context_pct: float = 0.0
     context_tokens: int = 0
     working: bool = False
+
+
+# セッションごとに直近判明したコンテキストトークン数を保持するキャッシュ。
+# SessionInfoは毎ポーリングで作り直されるため、この値はモジュールレベルで持つ。
+_last_known_tokens: dict[str, int] = {}
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -139,30 +145,50 @@ def _read_last_usage(transcript: Path) -> dict | None:
     Task(サブエージェント)呼び出しは isSidechain: true として同じファイルに
     記録され、メインの会話とは無関係な(別のコンテキストウィンドウの)トークン数
     を持つため、必ず除外する。これを除外しないと /context の表示と一致しなくなる。
+
+    直近の行がコマンド出力・画像等で非常に大きいと、その1行だけで初期の読み取り
+    範囲(TRANSCRIPT_TAIL_BYTES)を超えてしまい、直前のusage行が範囲外になって
+    見つからないことがある(セッションが活発なほど起きやすい)。見つからない場合は
+    読み取り範囲を段階的に広げて再試行することで、これを防ぐ。
     """
     try:
         size = transcript.stat().st_size
-        with transcript.open("rb") as fh:
-            if size > TRANSCRIPT_TAIL_BYTES:
-                fh.seek(-TRANSCRIPT_TAIL_BYTES, os.SEEK_END)
-            data = fh.read()
     except OSError:
         return None
 
-    for line in reversed(data.split(b"\n")):
-        line = line.strip()
-        if not line:
-            continue
+    tail_size = min(TRANSCRIPT_TAIL_BYTES, size)
+    while True:
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("isSidechain"):
-            continue
-        usage = (obj.get("message") or {}).get("usage")
-        if usage:
-            return usage
-    return None
+            with transcript.open("rb") as fh:
+                if tail_size < size:
+                    fh.seek(-tail_size, os.SEEK_END)
+                data = fh.read()
+        except OSError:
+            return None
+
+        for line in reversed(data.split(b"\n")):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("isSidechain"):
+                continue
+            message = obj.get("message") or {}
+            if message.get("model") == "<synthetic>":
+                # 実際のAPI呼び出しを伴わない合成メッセージ(中断時の後処理等)で、
+                # usageが全項目0のダミー値になっている。実際のコンテキスト量とは
+                # 無関係なので無視し、その前の本物のassistantメッセージを見る。
+                continue
+            usage = message.get("usage")
+            if usage:
+                return usage
+
+        if tail_size >= size or tail_size >= TRANSCRIPT_MAX_SCAN_BYTES:
+            return None
+        tail_size = min(tail_size * 4, TRANSCRIPT_MAX_SCAN_BYTES, size)
 
 
 def _update_usage_and_activity(info: SessionInfo) -> None:
@@ -186,11 +212,14 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
             + usage.get("cache_creation_input_tokens", 0)
             + usage.get("cache_read_input_tokens", 0)
         )
-        info.context_tokens = tokens
-        info.context_pct = min(100.0, tokens / CONTEXT_TOKEN_LIMIT * 100.0)
+        _last_known_tokens[info.session_id] = tokens
     else:
-        info.context_tokens = 0
-        info.context_pct = 0.0
+        # 拡大読み取りでも見つからなかった場合(書き込み中の行が一時的に不完全、等)。
+        # 0に落とすとアクティブ中に瞬間的な0表示が起きるため、直近の既知値を保持する。
+        tokens = _last_known_tokens.get(info.session_id, 0)
+
+    info.context_tokens = tokens
+    info.context_pct = min(100.0, tokens / CONTEXT_TOKEN_LIMIT * 100.0)
 
 
 def format_tokens(n: int) -> str:
