@@ -10,3 +10,6 @@ __pycache__/
 project_init_prompt.txt
 バイブコーディング開始前チェックリスト（コピペ用）.md
 スクリーンショット *.png
+
+# Claude Codeセッションの内部管理ファイル(誤ってコミットしないよう除外)
+.claude/
