@@ -113,6 +113,37 @@ systemctl enable --now claude-monitor
 
 ---
 
+## 使い方A': 接続先を切り替えられるPWAシェル(`docs/index.html`)
+
+LAN IP・Tailscale IP・SSHトンネル経由のlocalhostなど、**接続先が状況によって変わる**場合向けの、
+サーバー本体とは別の軽量フロントエンドです。GitHub Pagesで公開すると常に同じURLで
+使えるようになり、一度サーバーのアドレスを入力すればその端末に保存され、次回起動時は
+自動的に再接続します(サーバー本体にはアドレスなどの秘匿情報を一切埋め込みません)。
+
+公開URL: `https://<GitHubユーザー名>.github.io/claude-code-monitor/`
+
+### 使い方
+1. 上記URLをブラウザで開く(初回はChrome/Edgeで「インストール」してホーム画面/デスクトップに
+   置くことも可能。GitHub PagesはHTTPS配信のため、PWAインストールもここでは正常に機能する)
+2. 初回起動時に接続先入力フォームが出るので、`claude_monitor_web.py`が動いているサーバーの
+   アドレスを入力(例: `192.168.1.10:8765` / `localhost:8765`)。「接続する」を押すと疎通確認した
+   上でその端末(ブラウザ)に保存される
+3. 次回以降はこの端末では自動的に保存済みのアドレスへ接続する。接続先を変えたい場合は
+   画面右上の「接続先: ... (変更)」から再設定できる
+
+### サーバー側の前提(CORS)
+`docs/index.html`は別オリジン(GitHub Pages)からサーバーの`/api/sessions`等をfetchするため、
+`claude_monitor_web.py`は`Access-Control-Allow-Origin: *`を返すようにしてある
+(公開しているのはセッション名・作業ディレクトリ・コンテキスト使用率のみで、認証情報などは
+含まれないため、オリジン制限はかけていない)。サーバー側のバージョンが古いとCORSヘッダーが
+付かず接続に失敗するので、`claude_monitor_web.py`は最新版を使うこと。
+
+### GitHub Pagesの設定(初回のみ)
+リポジトリの Settings → Pages で、Source を「Deploy from a branch」、Branch を
+`main` / `/docs` に設定する。反映まで数分かかることがある。
+
+---
+
 ## 使い方B: デスクトップGUI版
 
 GUIが直接使える環境(コンテナにデスクトップ環境がある、またはSSHのX11フォワーディングを使う)向けです。

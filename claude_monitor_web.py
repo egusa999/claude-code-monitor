@@ -432,12 +432,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 "sessions": [asdict(s) for s in get_sessions()],
             }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self._send(200, body, "application/json; charset=utf-8")
+            self._send(200, body, "application/json; charset=utf-8", cors=True)
         elif self.path == "/api/kickoff":
             payload = _kickoff_state_payload()
             status = 503 if "error" in payload else 200
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self._send(status, body, "application/json; charset=utf-8")
+            self._send(status, body, "application/json; charset=utf-8", cors=True)
         elif self.path == "/manifest.json":
             self._send(200, MANIFEST_JSON, "application/manifest+json; charset=utf-8")
         elif self.path == "/icon.svg":
@@ -451,7 +451,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         if self.path == "/api/kickoff/toggle":
             if daily_kickoff is None:
                 self._send(503, b'{"error":"daily_kickoff module not found"}',
-                            "application/json; charset=utf-8")
+                            "application/json; charset=utf-8", cors=True)
                 return
             length = int(self.headers.get("Content-Length", "0") or "0")
             raw = self.rfile.read(length) if length else b"{}"
@@ -462,14 +462,34 @@ class MonitorHandler(BaseHTTPRequestHandler):
             enabled = bool(payload.get("enabled", True))
             daily_kickoff.set_enabled(enabled)
             body = json.dumps(_kickoff_state_payload(), ensure_ascii=False).encode("utf-8")
-            self._send(200, body, "application/json; charset=utf-8")
+            self._send(200, body, "application/json; charset=utf-8", cors=True)
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def do_OPTIONS(self) -> None:
+        # ブラウザのCORSプリフライト(POST /api/kickoff/toggle 用)に応答する。
+        if self.path.startswith("/api/"):
+            self.send_response(204)
+            self._write_cors_headers()
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _write_cors_headers(self) -> None:
+        # PWAシェル(GitHub Pages等、別オリジン)からこのAPIを呼べるようにする。
+        # 公開しているのはセッション名・作業ディレクトリ・コンテキスト使用率のみで、
+        # 認証トークンや機密情報は扱わないため、オリジン制限はかけていない。
+        self.send_header("Access-Control-Allow-Origin", "*")
+
+    def _send(self, status: int, body: bytes, content_type: str, cors: bool = False) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if cors:
+            self._write_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
