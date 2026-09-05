@@ -1,0 +1,12 @@
+# 実行時に自動生成される状態・ログ(個人の実行履歴が残るため除外)
+kickoff_state.json
+kickoff.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 他プロジェクト由来のメモ・スクリーンショット
+project_init_prompt.txt
+バイブコーディング開始前チェックリスト（コピペ用）.md
+スクリーンショット *.png

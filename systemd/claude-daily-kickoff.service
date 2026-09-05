@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude Code daily 4am (JST) Hello kickoff
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /path/to/claude_monitor/daily_kickoff.py
+User=root
