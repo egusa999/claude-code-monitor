@@ -29,16 +29,17 @@
     --green: #3ddc84;
   }
   * { box-sizing: border-box; }
-  body {
+  html, body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
     font-family: "Segoe UI", "Hiragino Sans", sans-serif;
+  }
+  body {
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 24px 12px;
-    min-height: 100vh;
+    padding: 16px;
   }
   .panel {
     width: 100%;
@@ -202,7 +203,6 @@
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 20px;
-    margin-top: 10vh;
   }
   .setup-panel h1 { font-size: 16px; margin: 0 0 6px; }
   .setup-panel p { font-size: 12px; color: var(--text-dim); line-height: 1.7; margin: 0 0 14px; }
@@ -307,6 +307,8 @@ function showSetup(prefill) {
   setupInput.value = prefill || '';
   setupError.textContent = '';
   setupInput.focus();
+  lastFitHeight = 0;
+  fitWindowToContent();
 }
 
 async function tryConnect(address) {
@@ -342,9 +344,36 @@ const revealedUuids = new Set();
 let lastLimit = 0;
 let lastSessions = [];
 
+// インストール済みPWA(standaloneウィンドウ)の場合のみ、コンテンツの実サイズに
+// 合わせてウィンドウ自体をリサイズする。通常のブラウザタブでは何もしない
+// (resizeToはタブウィンドウには効かないため、呼んでも無害・無効果)。
+function isStandalone() {
+  return window.matchMedia('(display-mode: standalone)').matches
+    || window.navigator.standalone === true;
+}
+let lastFitHeight = 0;
+function fitWindowToContent() {
+  if (!isStandalone()) return;
+  requestAnimationFrame(() => {
+    const rect = document.body.getBoundingClientRect();
+    const contentHeight = Math.ceil(rect.height);
+    if (Math.abs(contentHeight - lastFitHeight) < 4) return; // 微差では動かさない
+    lastFitHeight = contentHeight;
+    const chromeWidth = window.outerWidth - window.innerWidth;
+    const chromeHeight = window.outerHeight - window.innerHeight;
+    try {
+      window.resizeTo(
+        Math.ceil(rect.width) + chromeWidth,
+        contentHeight + chromeHeight
+      );
+    } catch (e) { /* ブラウザによっては拒否される。無視してよい */ }
+  });
+}
+
 function renderRows(limit, sessions) {
   if (sessions.length === 0) {
     rowsEl.innerHTML = '<div class="empty">アクティブなセッションはありません</div>';
+    fitWindowToContent();
     return;
   }
   rowsEl.innerHTML = sessions.map(s => {
@@ -361,6 +390,7 @@ function renderRows(limit, sessions) {
       </div>
     `;
   }).join('');
+  fitWindowToContent();
 }
 
 rowsEl.addEventListener('click', (e) => {
@@ -381,6 +411,7 @@ async function refresh() {
     renderRows(lastLimit, lastSessions);
   } catch (e) {
     rowsEl.innerHTML = '<div class="empty">サーバーに接続できません(起動状態・アドレスを確認してください)</div>';
+    fitWindowToContent();
   }
 }
 
@@ -404,6 +435,7 @@ function renderKickoff(state) {
     次回実行(予定): ${escapeHtml(state.next_run_local || '-')}<br>
     前回実行: ${formatLocal(state.last_run)} <span class="${statusClass}">${escapeHtml(statusLabel)}</span>
   `;
+  fitWindowToContent();
 }
 
 async function refreshKickoff() {
@@ -442,6 +474,7 @@ function startApp(url) {
   currentAddressEl.textContent = url.replace(/^https?:\/\//, '');
   setupEl.hidden = true;
   appEl.hidden = false;
+  lastFitHeight = 0;
   refresh();
   refreshKickoff();
   if (pollTimer) clearInterval(pollTimer);
