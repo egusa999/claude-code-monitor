@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import ssl
 import subprocess
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -499,6 +500,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1",
                          help="バインドアドレス(既定: 127.0.0.1 = ローカルのみ。SSH -L 経由で見る想定)")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--cert", default=None,
+                         help="TLS証明書ファイル(.crt/.pem)。指定するとHTTPSで待受(例: tailscale certで発行したもの)")
+    parser.add_argument("--key", default=None,
+                         help="TLS秘密鍵ファイル(.key)。--certとセットで指定")
     parser.add_argument("--context-limit", type=int, default=None,
                          help="コンテキストウィンドウの上限トークン数(既定: 環境変数 "
                               "CLAUDE_CONTEXT_TOKEN_LIMIT、未設定なら1,000,000)。"
@@ -509,7 +514,13 @@ def main() -> None:
         claude_monitor.CONTEXT_TOKEN_LIMIT = args.context_limit
 
     server = ThreadingHTTPServer((args.host, args.port), MonitorHandler)
-    print(f"Claude Code Monitor (Web) を起動しました: http://{args.host}:{args.port}")
+    scheme = "http"
+    if args.cert and args.key:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=args.cert, keyfile=args.key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+    print(f"Claude Code Monitor (Web) を起動しました: {scheme}://{args.host}:{args.port}")
     print("終了する場合は Ctrl+C")
     try:
         server.serve_forever()
