@@ -308,6 +308,7 @@ function showSetup(prefill) {
   setupError.textContent = '';
   setupInput.focus();
   lastFitHeight = 0;
+  appSizeLocked = false;
   fitWindowToContent();
 }
 
@@ -352,8 +353,12 @@ function isStandalone() {
     || window.navigator.standalone === true;
 }
 let lastFitHeight = 0;
+// 初回表示でウィンドウサイズを内容に合わせた後は、セッション数の増減などで
+// 幅・高さが勝手に変化しないようロックする(startApp/showSetupで解除)。
+let appSizeLocked = false;
 function fitWindowToContent() {
   if (!isStandalone()) return;
+  if (appSizeLocked) return;
   requestAnimationFrame(() => {
     const rect = document.body.getBoundingClientRect();
     const contentHeight = Math.ceil(rect.height);
@@ -475,8 +480,11 @@ function startApp(url) {
   setupEl.hidden = true;
   appEl.hidden = false;
   lastFitHeight = 0;
-  refresh();
-  refreshKickoff();
+  appSizeLocked = false;
+  Promise.all([refresh(), refreshKickoff()]).then(() => {
+    // 初回表示のレイアウトが確定した後にサイズを固定する
+    setTimeout(() => { appSizeLocked = true; }, 300);
+  });
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => { refresh(); refreshKickoff(); }, POLL_INTERVAL_MS);
 }
