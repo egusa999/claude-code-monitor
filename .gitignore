@@ -13,3 +13,13 @@ project_init_prompt.txt
 
 # Claude Codeセッションの内部管理ファイル(誤ってコミットしないよう除外)
 .claude/
+
+# Claude用の内部作業記録一式(LAN IP・デプロイ実パス等の内部情報を含むため
+# Publicリポジトリにはpushしない)
+narrative_log.md
+rules.md
+open_issues.md
+narrative_archive.md
+next_session_prompt.txt
+session_start_prompt.txt
+session_end_prompt.txt
