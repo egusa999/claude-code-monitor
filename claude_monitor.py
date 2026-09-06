@@ -199,16 +199,26 @@ def _read_last_usage(transcript: Path) -> dict | None:
     return None
 
 
-def _is_tool_pending(transcript: Path) -> bool:
-    """トランスクリプトの最後の書き込みが『まだ結果の来ていない tool_use 呼び出し』か。
+def _is_awaiting_response(transcript: Path) -> bool:
+    """トランスクリプトの最後の『メッセージ』が、まだアシスタントの応答の
+    書き込みが完了していない状態(=作業中とみなすべき状態)かどうか。
 
-    ツール実行中(コマンド実行・サブエージェント呼び出し等)は、そのtool_use行が
-    書き込まれてから結果(tool_result)が返るまでファイルへの新規書き込みが
-    止まるため、mtimeの新しさだけでは「作業中」と判定できない。この間隙を
-    埋めるための追加シグナル(サブエージェントの呼び出し中も「本体は作業中」の
-    意味で含めたいため、isSidechainでは絞り込まない)。
+    最後の書き込みがuser側(人間の新規プロンプト、またはツール実行結果)なら、
+    アシスタントがまだ考え始めていない・思考中の可能性がある。最初のthinking
+    ブロックが完成するまではファイルへの新規書き込みが一切発生しないため、
+    mtimeの新しさだけでは「プロンプト送信直後の考え中」を作業中と判定できない
+    (実際にこれが原因で、送信直後にランプが赤にならない不具合が起きた)。
+    最後の書き込みがassistant側でstop_reasonが"tool_use"の場合は、ツール実行
+    結果待ち(コマンド実行・サブエージェント呼び出し等、結果が返るまで新規
+    書き込みが止まる)。いずれもサブエージェント呼び出し中を「本体は作業中」の
+    意味で含めたいため、isSidechainでは絞り込まない。
     """
     for obj in _iter_recent_entries(transcript):
+        entry_type = obj.get("type")
+        if entry_type not in ("user", "assistant"):
+            continue
+        if entry_type == "user":
+            return True
         message = obj.get("message") or {}
         return message.get("stop_reason") == "tool_use"
     return False
@@ -227,7 +237,7 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
     except OSError:
         mtime = 0.0
     mtime_fresh = (time.time() - mtime) < WORKING_THRESHOLD_SEC
-    info.working = mtime_fresh or _is_tool_pending(transcript)
+    info.working = mtime_fresh or _is_awaiting_response(transcript)
 
     usage = _read_last_usage(transcript)
     if usage:
