@@ -23,6 +23,7 @@ import os
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 # 右側の数字に合わせて設定すること。
 CONTEXT_TOKEN_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_TOKEN_LIMIT", "1000000"))
 WORKING_THRESHOLD_SEC = 6.0         # この秒数以内にトランスクリプト更新があれば「作業中」
+AWAITING_PROMPT_MAX_AGE_SEC = 180.0  # 新規プロンプト/ツール結果を「考え中」とみなす最大経過時間
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 BLINK_INTERVAL_MS = 500             # 赤ランプの点滅間隔
 TRANSCRIPT_TAIL_BYTES = 65536        # トランスクリプト末尾読み取りの初期サイズ
@@ -199,26 +201,53 @@ def _read_last_usage(transcript: Path) -> dict | None:
     return None
 
 
+def _entry_age_sec(obj: dict) -> float | None:
+    """エントリの`timestamp`(ISO8601)から、現在までの経過秒数を返す。
+    タイムスタンプが無い/壊れている場合はNoneを返す。
+    """
+    ts = obj.get("timestamp")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
 def _is_awaiting_response(transcript: Path) -> bool:
     """トランスクリプトの最後の『メッセージ』が、まだアシスタントの応答の
     書き込みが完了していない状態(=作業中とみなすべき状態)かどうか。
 
-    最後の書き込みがuser側(人間の新規プロンプト、またはツール実行結果)なら、
-    アシスタントがまだ考え始めていない・思考中の可能性がある。最初のthinking
-    ブロックが完成するまではファイルへの新規書き込みが一切発生しないため、
-    mtimeの新しさだけでは「プロンプト送信直後の考え中」を作業中と判定できない
-    (実際にこれが原因で、送信直後にランプが赤にならない不具合が起きた)。
-    最後の書き込みがassistant側でstop_reasonが"tool_use"の場合は、ツール実行
-    結果待ち(コマンド実行・サブエージェント呼び出し等、結果が返るまで新規
-    書き込みが止まる)。いずれもサブエージェント呼び出し中を「本体は作業中」の
-    意味で含めたいため、isSidechainでは絞り込まない。
+    Claude Code Desktop連携時は、実際の会話(user/assistant)以外にも
+    `bridge-session`/`last-prompt`/`atis-latch`等のブックキーピング専用の
+    エントリが同じファイルに書き込まれる。これらにはtimestampが無いため
+    読み飛ばし、直近の実際のuser/assistantメッセージを見る。
+
+    - 直近の実メッセージがuser側(人間の新規プロンプト、またはツール実行結果)
+      なら、アシスタントがまだ考え始めていない・思考中の可能性がある。最初の
+      thinkingブロックが完成するまではファイルへの新規書き込みが一切発生
+      しないため、mtimeの新しさだけでは「プロンプト送信直後の考え中」を
+      作業中と判定できない(実際にこれが原因で、送信直後にランプが赤に
+      ならない不具合が起きた)。ただし、そのuser発言自体が
+      `AWAITING_PROMPT_MAX_AGE_SEC`より古い場合は「考え中」とはみなさない。
+      理由: 会話が実質終了して久しいセッションでも、上記ブックキーピング
+      エントリだけが書き込まれ続けることで、読み飛ばした先にある古いuser
+      発言を「今まさに考え中」と誤判定し、ランプが永久に赤点滅し続ける
+      不具合が実際に起きた。
+    - 直近の実メッセージがassistant側でstop_reasonが"tool_use"の場合は、
+      ツール実行結果待ち(コマンド実行・サブエージェント呼び出し等、結果が
+      返るまで新規書き込みが止まる)。こちらは実行時間の上限がないため
+      年齢での打ち切りはしない。いずれもサブエージェント呼び出し中を
+      「本体は作業中」の意味で含めたいため、isSidechainでは絞り込まない。
     """
     for obj in _iter_recent_entries(transcript):
         entry_type = obj.get("type")
         if entry_type not in ("user", "assistant"):
             continue
         if entry_type == "user":
-            return True
+            age = _entry_age_sec(obj)
+            return age is not None and age < AWAITING_PROMPT_MAX_AGE_SEC
         message = obj.get("message") or {}
         return message.get("stop_reason") == "tool_use"
     return False
