@@ -1,95 +1,114 @@
-# Claude Code Monitor 説明書
+English | [日本語](README.ja.md)
 
-Claude Code の稼働中セッションを一覧表示するモニタリングツールです。
-「セッション名(右の「UUID」ボタンをクリックするとセッションIDを表示/非表示)」
-「コンテキスト使用量(% + トークン数)」「状態ランプ(作業中=赤点滅 / 待機中=緑点灯)」を表示します。
-(WebブラウザUIのみ。デスクトップGUI版はセッションIDを表示しません)
+# Claude Code Monitor
 
-同梱ファイルは以下の通りです。モニター本体は `claude_monitor.py` / `claude_monitor_web.py` の
-**どちらか一方だけ使えば動きます**。`daily_kickoff.py` 以下は「毎朝4時 Hello送信」機能用です。
+A monitoring tool that lists the Claude Code sessions currently running on a
+host. For each session it shows the **session name** (click the "UUID" button
+next to it to reveal/hide the session ID), **context usage** (% + token
+count), and a **status lamp** (working = blinking red, idle = solid green).
+(Web UI only — the desktop GUI version does not show the session ID.)
 
-| ファイル | 用途 |
+The bundled files are listed below. The monitor itself is either
+`claude_monitor.py` **or** `claude_monitor_web.py` — **you only need one of
+the two**. `daily_kickoff.py` and the files below it are for the "send Hello
+every morning at 4am" feature.
+
+| File | Purpose |
 |---|---|
-| `claude_monitor.py` | デスクトップGUI版(tkinter)。GUIのある環境、またはX11転送で使用 |
-| `claude_monitor_web.py` | Webブラウザ版。**Proxmox LXC等のヘッドレス環境ではこちらを推奨** |
-| `daily_kickoff.py` | 毎朝4時(JST)に Claude へ "Hello" を送るスクリプト本体(詳細は後述) |
-| `kickoff_state.json` | `daily_kickoff.py` の状態(有効/無効・前回実行結果)。実行時に自動生成 |
-| `kickoff.log` | `daily_kickoff.py` の簡易ログ。実行時に自動生成 |
-| `systemd/claude-daily-kickoff.service` / `.timer` | `daily_kickoff.py` を毎朝4時JSTに起動するsystemdユニット |
+| `claude_monitor.py` | Desktop GUI version (tkinter). Use on a machine with a GUI, or over X11 forwarding |
+| `claude_monitor_web.py` | Web browser version. **Recommended for headless environments such as a Proxmox LXC container** |
+| `daily_kickoff.py` | The script that sends "Hello" to Claude every morning at 4am JST (details below) |
+| `kickoff_state.json` | State for `daily_kickoff.py` (enabled/disabled, last run result). Auto-generated at runtime |
+| `kickoff.log` | A simple log for `daily_kickoff.py`. Auto-generated at runtime |
+| `systemd/claude-daily-kickoff.service` / `.timer` | systemd units that fire `daily_kickoff.py` every morning at 4am JST |
 
-どちらも Python 標準ライブラリのみで動作します(追加インストール不要。GUI版のみ環境によって `tkinter` の追加インストールが必要な場合があります)。
-
----
-
-## 前提: このツールが読みに行くデータ
-
-以下は Claude Code が自動生成するファイルで、**このツールを実行するホスト上に存在している必要があります**(=SSH先のリモートに置くのではなく、Claude Codeセッションが実際に動いているマシン/コンテナ上で実行してください)。
-
-- `~/.claude/sessions/*.json` … 起動中セッションのメタ情報(PID, セッションID, 作業ディレクトリ等)
-- `~/.claude/projects/*/<セッションID>.jsonl` … 会話トランスクリプト(コンテキスト使用量の算出に使用)
-
-上記が存在しない/読めない場合、セッションは「アクティブなセッションはありません」と表示されます。
+Both versions run on the Python standard library only (no extra packages
+needed — the GUI version may require installing `tkinter` separately
+depending on your environment).
 
 ---
 
-## 配置方法
+## Prerequisite: the data this tool reads
 
-1. このZIP内の2ファイルを、Claude Codeを実行しているホスト(Proxmox LXCコンテナ内)の任意のフォルダに展開する
+The following files are generated automatically by Claude Code and **must
+exist on the same host where this tool runs** (run it on the machine/container
+where the Claude Code sessions actually run — not on a remote box you only
+SSH from).
+
+- `~/.claude/sessions/*.json` — metadata for running sessions (PID, session ID,
+  working directory, etc.)
+- `~/.claude/projects/*/<session-id>.jsonl` — the conversation transcript
+  (used to compute context usage)
+
+If these don't exist or can't be read, the session list shows "No active
+sessions."
+
+---
+
+## Setup
+
+1. Extract the files into any folder on the host running Claude Code (e.g.
+   inside your Proxmox LXC container):
    ```bash
    mkdir -p ~/claude_monitor
-   # zipを展開して2ファイルをここに置く
+   # extract the files here
    ```
-2. Python3が入っていることを確認
+2. Confirm Python 3 is installed:
    ```bash
    python3 --version
    ```
 
 ---
 
-## 使い方A: Webブラウザ版(推奨・ヘッドレス環境向け)
+## Usage A: Web browser version (recommended for headless environments)
 
-### 1. LXCコンテナ側でサーバーを起動
+### 1. Start the server on the LXC container
 ```bash
 cd ~/claude_monitor
 python3 claude_monitor_web.py --port 8765
 ```
-デフォルトで `127.0.0.1` にのみバインドします(LAN上に公開されません)。
-`Ctrl+C` で停止します。
+By default it binds only to `127.0.0.1` (not exposed on the LAN).
+Press `Ctrl+C` to stop it.
 
-LAN内から直接(SSHトンネルなしで)アクセスしたい場合は `--host 0.0.0.0` を指定してください。
-Tailscale等のVPNに参加させている場合は、その仮想IPからも同じポートで届きます。
+To access it directly from the LAN (without an SSH tunnel), pass
+`--host 0.0.0.0`. If the host is also on a VPN such as Tailscale, it will be
+reachable on the same port from that virtual IP too.
 ```bash
 python3 claude_monitor_web.py --host 0.0.0.0 --port 8765
 ```
-⚠️ `0.0.0.0`で公開すると**認証なしで誰でも閲覧できます**(セッション名・作業ディレクトリ・
-コンテキスト使用率が見える)。LANやVPN内に信頼できない端末がいる環境では`127.0.0.1`のまま
-SSHトンネル経由での利用を推奨します。
+⚠️ Exposing it on `0.0.0.0` means **anyone can view it without
+authentication** (session names, working directories, and context usage are
+visible). If you can't trust every device on your LAN/VPN, keep it on
+`127.0.0.1` and use an SSH tunnel instead.
 
-### 2a. SSHトンネル経由で見る場合
+### 2a. Viewing over an SSH tunnel
 ```bash
-ssh -L 8765:localhost:8765 <ユーザー名>@<LXCのIPまたはホスト名>
+ssh -L 8765:localhost:8765 <user>@<LXC IP or hostname>
 ```
-このSSH接続を維持したまま、ブラウザで `http://localhost:8765` を開く。
+Keep this SSH connection open and browse to `http://localhost:8765`.
 
-### 2b. LAN/Tailscale直接アクセスの場合
+### 2b. Direct LAN/Tailscale access
 ```
-http://<LXCのLAN IPまたはTailscale IP>:8765
+http://<LXC's LAN IP or Tailscale IP>:8765
 ```
 
-1.5秒ごとに自動更新されます。作業中のセッションは赤いランプが点滅します。
+The page refreshes every 1.5 seconds. Sessions that are currently working
+show a blinking red lamp.
 
-### インストールして独立ウィンドウ化(PWA)
-PWA(manifest/アイコン/Service Worker)に対応しているため、Chrome/Edgeの「インストール」機能で
-タブ・アドレスバーのない独立ウィンドウとして開けます。
+### Installing it as a standalone window (PWA)
+It supports PWA features (manifest, icon, service worker), so Chrome/Edge's
+"Install" feature can turn it into a standalone window with no tab or
+address bar.
 
-⚠️ **ブラウザの仕様上、インストール機能は「セキュアなコンテキスト」(HTTPS、または`localhost`)
-でしか使えません。** `http://<LAN IP>:8765` のような素のHTTPアクセスではインストールボタンが
-出ません。確実にインストールしたい場合は上記2a(SSHトンネル→`localhost:8765`)を使ってください。
+⚠️ **Browsers only allow the install feature in a "secure context" (HTTPS, or
+`localhost`).** Plain HTTP access such as `http://<LAN IP>:8765` won't show
+an install button. To install it reliably, use option 2a above (SSH tunnel →
+`localhost:8765`).
 
-### 常時起動しておきたい場合(任意)
-`screen` や `tmux` で常駐させるか、systemdサービス化してください。
+### Keeping it running (optional)
+Run it inside `screen`/`tmux`, or set it up as a systemd service.
 
-例(systemdサービス化。LAN/Tailscaleへの直接公開ありの場合):
+Example (systemd service, for direct LAN/Tailscale exposure):
 ```ini
 # /etc/systemd/system/claude-monitor.service
 [Unit]
@@ -109,113 +128,132 @@ WantedBy=multi-user.target
 systemctl daemon-reload
 systemctl enable --now claude-monitor
 ```
-実運用(claudecode LXCコンテナ)では上記の設定で`claude-monitor.service`として常駐化済み。
+In production (the claudecode LXC container) it is already running
+persistently as `claude-monitor.service` with the config above.
 
 ---
 
-## 使い方A': 接続先を切り替えられるPWAシェル(`docs/index.html`)
+## Usage A': address-switchable PWA shell (`docs/index.html`)
 
-LAN IP・Tailscale IP・SSHトンネル経由のlocalhostなど、**接続先が状況によって変わる**場合向けの、
-サーバー本体とは別の軽量フロントエンドです。GitHub Pagesで公開すると常に同じURLで
-使えるようになり、一度サーバーのアドレスを入力すればその端末に保存され、次回起動時は
-自動的に再接続します(サーバー本体にはアドレスなどの秘匿情報を一切埋め込みません)。
+A lightweight front end, separate from the server itself, for situations
+where **the server address changes** — a LAN IP, a Tailscale IP, or
+`localhost` via an SSH tunnel. Publishing it on GitHub Pages gives you a
+single, stable URL: enter the server's address once and it's saved on that
+device, then it reconnects automatically on every later launch (no address
+or other secret is ever baked into the server itself).
 
-公開URL: `https://<GitHubユーザー名>.github.io/claude-code-monitor/`
+Published URL: `https://<your GitHub username>.github.io/claude-code-monitor/`
 
-### 使い方
-1. 上記URLをブラウザで開く(初回はChrome/Edgeで「インストール」してホーム画面/デスクトップに
-   置くことも可能。GitHub PagesはHTTPS配信のため、PWAインストールもここでは正常に機能する)
-2. 初回起動時に接続先入力フォームが出るので、`claude_monitor_web.py`が動いているサーバーの
-   アドレスを入力(例: `192.168.1.10:8765` / `localhost:8765`)。「接続する」を押すと疎通確認した
-   上でその端末(ブラウザ)に保存される
-3. 次回以降はこの端末では自動的に保存済みのアドレスへ接続する。接続先を変えたい場合は
-   画面右上の「接続先: ... (変更)」から再設定できる
+### How to use it
+1. Open the URL above in a browser (on first use you can also "Install" it in
+   Chrome/Edge to place it on your home screen/desktop — GitHub Pages serves
+   over HTTPS, so PWA installation works correctly here).
+2. On first launch you'll see a form asking for the address of the server
+   running `claude_monitor_web.py` (e.g. `192.168.1.10:8765` or
+   `localhost:8765`). Press "Connect" and, once it verifies the connection,
+   it's saved on that device (browser).
+3. On every later launch this device automatically connects to the saved
+   address. To change it, use "Address: ... (change)" in the top right.
 
-### サーバー側の前提(CORS)
-`docs/index.html`は別オリジン(GitHub Pages)からサーバーの`/api/sessions`等をfetchするため、
-`claude_monitor_web.py`は`Access-Control-Allow-Origin: *`を返すようにしてある
-(公開しているのはセッション名・作業ディレクトリ・コンテキスト使用率のみで、認証情報などは
-含まれないため、オリジン制限はかけていない)。サーバー側のバージョンが古いとCORSヘッダーが
-付かず接続に失敗するので、`claude_monitor_web.py`は最新版を使うこと。
+### Server-side prerequisite (CORS)
+Since `docs/index.html` fetches the server's `/api/sessions` etc. from a
+different origin (GitHub Pages), `claude_monitor_web.py` sends
+`Access-Control-Allow-Origin: *` (the only data exposed is session names,
+working directories, and context usage — nothing that requires
+authentication — so no origin restriction is applied). An older server
+version won't send the CORS header and the connection will fail, so make
+sure `claude_monitor_web.py` is up to date.
 
-### GitHub Pagesの設定(初回のみ)
-リポジトリの Settings → Pages で、Source を「Deploy from a branch」、Branch を
-`main` / `/docs` に設定する。反映まで数分かかることがある。
+### Setting up GitHub Pages (one-time)
+In the repository's Settings → Pages, set Source to "Deploy from a branch"
+and Branch to `main` / `/docs`. It can take a few minutes to go live.
 
 ---
 
-## 使い方B: デスクトップGUI版
+## Usage B: desktop GUI version
 
-GUIが直接使える環境(コンテナにデスクトップ環境がある、またはSSHのX11フォワーディングを使う)向けです。
+For environments where a GUI is directly available (the container has a
+desktop environment, or you use SSH X11 forwarding).
 
-### ローカルにGUI環境がある場合
+### If you have a local GUI environment
 ```bash
 python3 claude_monitor.py
 ```
-`tkinter` が入っていないと `ModuleNotFoundError: No module named 'tkinter'` になります。Debian/Ubuntu系なら:
+If `tkinter` isn't installed you'll get
+`ModuleNotFoundError: No module named 'tkinter'`. On Debian/Ubuntu:
 ```bash
 apt install python3-tk
 ```
 
-### SSH経由でGUIを手元に転送する場合(X11フォワーディング)
-- リモート(LXC)側: `sshd_config` に `X11Forwarding yes`、`xauth` パッケージが入っていること
-- 手元側: Xサーバーが必要(Windows: VcXsrv / X410、Mac: XQuartz、Linuxは標準で可のことが多い)
+### Forwarding the GUI over SSH (X11 forwarding)
+- Remote (LXC) side: `sshd_config` needs `X11Forwarding yes`, and the `xauth`
+  package must be installed
+- Local side: you need an X server (Windows: VcXsrv / X410; Mac: XQuartz;
+  Linux usually has one built in)
 
 ```bash
-ssh -X <ユーザー名>@<LXCのIPまたはホスト名>
+ssh -X <user>@<LXC IP or hostname>
 python3 claude_monitor.py
 ```
 
 ---
 
-## 設定値の変更(任意)
+## Changing settings (optional)
 
-### コンテキスト上限(重要・環境によって必ず確認)
+### Context limit (important — always check for your environment)
 
-コンテキスト使用率は `使用トークン数 ÷ CONTEXT_TOKEN_LIMIT` で計算しています。この上限値は
-契約/モデルによって **200,000** だったり **1,000,000(拡張コンテキスト)** だったりするため、
-既定値のままだと Claude Code の `/context` コマンドの表示(%)とズレます。
+Context usage is calculated as `tokens used ÷ CONTEXT_TOKEN_LIMIT`. This
+limit is **200,000** or **1,000,000 (extended context)** depending on your
+plan/model, so leaving it at the default can make it disagree with the
+percentage Claude Code's `/context` command shows.
 
-`/context` を実行すると `Tokens: 96.6k / 1m (10%)` のように出るので、右側の分母
-(この例では `1m` = 1,000,000)を確認し、以下のいずれかの方法で合わせてください。
+Running `/context` prints something like `Tokens: 96.6k / 1m (10%)` — check
+the denominator on the right (`1m` = 1,000,000 in this example) and match it
+using one of the following:
 
-- 環境変数で指定(両ファイル共通、恒久的にしたい場合は `.bashrc` 等に追記):
+- Set it via an environment variable (shared by both files; add it to
+  `.bashrc` etc. to make it permanent):
   ```bash
   export CLAUDE_CONTEXT_TOKEN_LIMIT=1000000
   python3 claude_monitor_web.py --port 8765
   ```
-- Web版はコマンドライン引数でも指定可能:
+- The web version also accepts a command-line flag:
   ```bash
   python3 claude_monitor_web.py --port 8765 --context-limit 1000000
   ```
-- 何も指定しない場合の既定値は `1,000,000` です。200,000トークン契約の場合は明示的に
-  `200000` を指定してください。
+- If nothing is set, the default is `1,000,000`. If your plan uses 200,000
+  tokens, set `200000` explicitly.
 
-### その他の定数
+### Other constants
 
-両ファイル冒頭に定数が並んでいます。必要に応じて書き換えてください。
+Both files have a block of constants near the top. Edit them as needed.
 
-- `WORKING_THRESHOLD_SEC`(既定 6秒): トランスクリプトがこの秒数以内に更新されていれば「作業中(赤)」と判定
-- `POLL_INTERVAL_MS`(既定 1500ms): 一覧の再取得間隔
-- `BLINK_INTERVAL_MS`(GUI版のみ、既定 500ms): 赤ランプの点滅間隔
+- `WORKING_THRESHOLD_SEC` (default 6s): if the transcript was updated within
+  this many seconds, the session is considered "working" (red)
+- `POLL_INTERVAL_MS` (default 1500ms): how often the list is refreshed
+- `BLINK_INTERVAL_MS` (GUI version only, default 500ms): how fast the red
+  lamp blinks
 
-Web版はブラウザ側のポーリング間隔(`POLL_INTERVAL_MS`)を変更した場合、サーバー再起動が必要です(HTML生成時に埋め込まれるため)。
+If you change the web version's client-side poll interval
+(`POLL_INTERVAL_MS`), restart the server — it's baked into the generated
+HTML.
 
 ---
 
-## 「毎朝4時 Hello送信」機能(daily_kickoff.py)
+## The "Hello every morning at 4am" feature (daily_kickoff.py)
 
-毎朝4時(JST)に `claude -p -n daily-4am-hello "Hello"` を実行し、新規セッションを1つ
-開始する常駐スケジューラです。`-p`(print/非対話モード)を使っているため応答が返れば
-プロセスは即終了し、`--bg` のようにバックグラウンドエージェントとして残り続けて
-セッション一覧や `claude agents` に溜まっていくことはありません。会話自体は通常の
-セッションと同様に履歴へ保存されます。
+A persistent scheduler that runs `claude -p -n daily-4am-hello "Hello"` every
+morning at 4am JST, starting one new session. Because it uses `-p`
+(print/non-interactive mode), the process exits as soon as it gets a
+response — unlike `--bg`, it never lingers as a background agent that piles
+up in the session list or `claude agents`. The conversation itself is saved
+to history just like any normal session.
 
-Web版モニターのトップに稼働状態パネルが表示され、有効/無効をトグルできます。
-`claude_monitor_web.py` は同じフォルダの `daily_kickoff.py` を import して、
-状態の読み書き(`/api/kickoff`, `/api/kickoff/toggle`)に使います。
+The web monitor's top panel shows its status and lets you toggle it on/off.
+`claude_monitor_web.py` imports `daily_kickoff.py` from the same folder to
+read/write that state (`/api/kickoff`, `/api/kickoff/toggle`).
 
-### 常駐化(systemdタイマー)
+### Making it persistent (systemd timer)
 
 ```bash
 cp systemd/claude-daily-kickoff.service systemd/claude-daily-kickoff.timer /etc/systemd/system/
@@ -223,65 +261,69 @@ systemctl daemon-reload
 systemctl enable --now claude-daily-kickoff.timer
 ```
 
-`claude-daily-kickoff.service` の `ExecStart` は本番配置場所
-(`/root/claude_monitor/daily_kickoff.py`)を指しているため、`claude_monitor_web.py` 同様
-デプロイ手順(下記)でコピーしておくこと。
+`claude-daily-kickoff.service`'s `ExecStart` points at the production
+location (`/root/claude_monitor/daily_kickoff.py`), so copy it there the same
+way as `claude_monitor_web.py` (see Deployment below).
 
-タイマーは `OnCalendar=*-*-* 04:00:00 Asia/Tokyo` で毎朝4時JST(=系統によっては前日19:00 UTC)
-に発火。`enable`済みなのでLXC再起動後も自動的に有効なまま。`Persistent=true` のため、
-LXCが4時をまたいで停止していた場合も起動後に1回分を実行します。
+The timer fires on `OnCalendar=*-*-* 04:00:00 Asia/Tokyo` — 4am JST (19:00
+UTC the previous day, depending on the season). It's already `enable`d, so it
+stays active across LXC restarts. With `Persistent=true`, if the container
+was stopped when 4am passed, it runs once as soon as it comes back up.
 
-次回実行予定の確認:
+Check the next scheduled run:
 ```bash
 systemctl list-timers claude-daily-kickoff.timer
 ```
 
-### 有効/無効の切り替え
+### Enabling/disabling it
 
-Web版パネルのトグルから操作するのが基本だが、CLIからも操作可能:
+Normally you'd use the toggle in the web panel, but it can also be controlled
+from the CLI:
 
 ```bash
-python3 daily_kickoff.py --set-enabled false   # 無効化(次回はスキップされる)
-python3 daily_kickoff.py --set-enabled true    # 有効化
-python3 daily_kickoff.py --status              # 現在の状態を表示
+python3 daily_kickoff.py --set-enabled false   # disable (next run is skipped)
+python3 daily_kickoff.py --set-enabled true    # enable
+python3 daily_kickoff.py --status              # show current state
 ```
 
-無効化してもsystemdタイマー自体は動き続けるが、`daily_kickoff.py` 側で
-「スキップ」として記録するだけで `claude` は起動しません。
+Disabling it leaves the systemd timer running — `daily_kickoff.py` itself
+just records it as "skipped" and never launches `claude`.
 
-### 手動実行(動作確認用)
+### Running it manually (to test it)
 
 ```bash
 python3 daily_kickoff.py
 ```
 
-実際に `claude -p` が実行され、Claude API/セッション利用が発生する点に注意。
+Note that this actually runs `claude -p`, which consumes real Claude
+API/session usage.
 
 ---
 
-## デプロイ手順(本番反映)
+## Deployment (pushing changes to production)
 
-`claude_monitor.py` / `claude_monitor_web.py` / `daily_kickoff.py` / `kickoff_state.json` を
-編集したら、本番配置場所 `/root/claude_monitor/` へコピーして関連サービスを再起動する。
+After editing `claude_monitor.py` / `claude_monitor_web.py` /
+`daily_kickoff.py` / `kickoff_state.json`, copy them to the production
+location `/root/claude_monitor/` and restart the relevant service.
 
 ```bash
 cp claude_monitor_web.py claude_monitor.py daily_kickoff.py /root/claude_monitor/
 systemctl restart claude-monitor.service
 ```
 
-`systemd/*.service` / `*.timer` を編集した場合は `/etc/systemd/system/` へコピーして
-`systemctl daemon-reload` すること。
+If you edit `systemd/*.service` / `*.timer`, copy them to
+`/etc/systemd/system/` and run `systemctl daemon-reload`.
 
 ---
 
-## トラブルシューティング
+## Troubleshooting
 
-| 症状 | 確認事項 |
+| Symptom | What to check |
 |---|---|
-| セッションが1件も出ない | `~/.claude/sessions/` と `~/.claude/projects/` がこのホスト上に存在するか確認。別ホスト/別コンテナのファイルは見えません |
-| `ModuleNotFoundError: No module named 'tkinter'` | GUI版のみで発生。`apt install python3-tk` などでインストール、またはWeb版を使う |
-| Webブラウザで開けない | SSHトンネル(`ssh -L 8765:localhost:8765 ...`)を張ったまま接続しているか確認。サーバーが起動しているか(`python3 claude_monitor_web.py`実行中か)を確認 |
-| ランプがずっと緑のまま | 実際に該当セッションでClaudeが処理中か確認。処理直後は最大 `WORKING_THRESHOLD_SEC` 秒ほど反映に遅れが出ます |
-| コンテキスト%が `/context` と合わない | 上記「コンテキスト上限」の設定を `/context` の分母(200k or 1m)に合わせてください。それでもズレる場合はサブエージェント(Task)実行中の可能性があるので、少し待ってから再確認してください |
-| ブラウザにインストールボタンが出ない | セキュアコンテキスト(HTTPSまたは`localhost`)でしかインストールできない仕様。素のLAN/Tailscale IPへのHTTPアクセスでは出ない。SSHトンネル経由の`localhost:8765`で開いてください |
-| `--host 0.0.0.0`にしたらセッション情報が誰でも見えるようになった | 仕様通り(認証なし)。信頼できない端末がいるネットワークでは`127.0.0.1`+SSHトンネル運用に戻してください |
+| No sessions show up at all | Check that `~/.claude/sessions/` and `~/.claude/projects/` exist on this host — files on a different host/container are never visible |
+| `ModuleNotFoundError: No module named 'tkinter'` | Only affects the GUI version. Install it with `apt install python3-tk`, or use the web version instead |
+| Can't open it in a browser | Check that the SSH tunnel (`ssh -L 8765:localhost:8765 ...`) is still connected, and that the server is actually running (`python3 claude_monitor_web.py`) |
+| The lamp stays green forever | Check whether Claude is actually processing in that session. There can be a delay of up to `WORKING_THRESHOLD_SEC` seconds right after it starts working |
+| Context % doesn't match `/context` | Match the "Context limit" setting above to `/context`'s denominator (200k or 1m). If it's still off, a sub-agent (Task) may be running — wait a moment and check again |
+| No install button appears in the browser | Installation only works in a secure context (HTTPS or `localhost`) — this is a browser restriction. It won't appear over plain HTTP to a LAN/Tailscale IP. Open it via an SSH tunnel at `localhost:8765` instead |
+| After setting `--host 0.0.0.0`, session info became visible to anyone | This is expected (there's no authentication). On a network with untrusted devices, go back to `127.0.0.1` + an SSH tunnel |
