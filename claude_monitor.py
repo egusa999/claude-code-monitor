@@ -205,8 +205,8 @@ def _is_tool_pending(transcript: Path) -> bool:
     ツール実行中(コマンド実行・サブエージェント呼び出し等)は、そのtool_use行が
     書き込まれてから結果(tool_result)が返るまでファイルへの新規書き込みが
     止まるため、mtimeの新しさだけでは「作業中」と判定できない。この間隙を
-    埋めるための追加シグナル(サブエージェントの呼び出しも「本体が待機中」という
-    意味では作業中に含めたいため、isSidechainでは絞り込まない)。
+    埋めるための追加シグナル(サブエージェントの呼び出し中も「本体は作業中」の
+    意味で含めたいため、isSidechainでは絞り込まない)。
     """
     for obj in _iter_recent_entries(transcript):
         message = obj.get("message") or {}
