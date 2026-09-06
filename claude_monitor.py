@@ -139,22 +139,19 @@ def _find_transcript(session_id: str) -> Path | None:
     return max(matches, key=lambda p: p.stat().st_mtime)
 
 
-def _read_last_usage(transcript: Path) -> dict | None:
-    """トランスクリプト末尾から、メインチェーンの最後の usage オブジェクトを取得する。
-
-    Task(サブエージェント)呼び出しは isSidechain: true として同じファイルに
-    記録され、メインの会話とは無関係な(別のコンテキストウィンドウの)トークン数
-    を持つため、必ず除外する。これを除外しないと /context の表示と一致しなくなる。
+def _iter_recent_entries(transcript: Path):
+    """トランスクリプト末尾から新しい順にJSONオブジェクトを返すジェネレータ。
 
     直近の行がコマンド出力・画像等で非常に大きいと、その1行だけで初期の読み取り
-    範囲(TRANSCRIPT_TAIL_BYTES)を超えてしまい、直前のusage行が範囲外になって
-    見つからないことがある(セッションが活発なほど起きやすい)。見つからない場合は
-    読み取り範囲を段階的に広げて再試行することで、これを防ぐ。
+    範囲(TRANSCRIPT_TAIL_BYTES)を超えてしまい、それより前の行が範囲外になって
+    見つからないことがある(セッションが活発なほど起きやすい)。呼び出し側が
+    欲しい行を見つけられずジェネレータを最後まで消費した場合は、読み取り範囲を
+    段階的に広げて(最大 TRANSCRIPT_MAX_SCAN_BYTES まで)再試行する。
     """
     try:
         size = transcript.stat().st_size
     except OSError:
-        return None
+        return
 
     tail_size = min(TRANSCRIPT_TAIL_BYTES, size)
     while True:
@@ -164,31 +161,57 @@ def _read_last_usage(transcript: Path) -> dict | None:
                     fh.seek(-tail_size, os.SEEK_END)
                 data = fh.read()
         except OSError:
-            return None
+            return
 
         for line in reversed(data.split(b"\n")):
             line = line.strip()
             if not line:
                 continue
             try:
-                obj = json.loads(line)
+                yield json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if obj.get("isSidechain"):
-                continue
-            message = obj.get("message") or {}
-            if message.get("model") == "<synthetic>":
-                # 実際のAPI呼び出しを伴わない合成メッセージ(中断時の後処理等)で、
-                # usageが全項目0のダミー値になっている。実際のコンテキスト量とは
-                # 無関係なので無視し、その前の本物のassistantメッセージを見る。
-                continue
-            usage = message.get("usage")
-            if usage:
-                return usage
 
         if tail_size >= size or tail_size >= TRANSCRIPT_MAX_SCAN_BYTES:
-            return None
+            return
         tail_size = min(tail_size * 4, TRANSCRIPT_MAX_SCAN_BYTES, size)
+
+
+def _read_last_usage(transcript: Path) -> dict | None:
+    """トランスクリプト末尾から、メインチェーンの最後の usage オブジェクトを取得する。
+
+    Task(サブエージェント)呼び出しは isSidechain: true として同じファイルに
+    記録され、メインの会話とは無関係な(別のコンテキストウィンドウの)トークン数
+    を持つため、必ず除外する。これを除外しないと /context の表示と一致しなくなる。
+    """
+    for obj in _iter_recent_entries(transcript):
+        if obj.get("isSidechain"):
+            continue
+        message = obj.get("message") or {}
+        if message.get("model") == "<synthetic>":
+            # 実際のAPI呼び出しを伴わない合成メッセージ(中断時の後処理等)で、
+            # usageが全項目0のダミー値になっている。実際のコンテキスト量とは
+            # 無関係なので無視し、その前の本物のassistantメッセージを見る。
+            continue
+        usage = message.get("usage")
+        if usage:
+            return usage
+    return None
+
+
+def _is_tool_pending(transcript: Path) -> bool:
+    """トランスクリプトの最後の書き込みが『まだ結果の来ていない tool_use 呼び出し』か。
+
+    ツール実行中(コマンド実行・サブエージェント呼び出し等)は、そのtool_use行が
+    書き込まれてから結果(tool_result)が返るまでファイルへの新規書き込みが
+    止まるため、mtimeの新しさだけでは「作業中」と判定できない。この間隙を
+    埋めるための追加シグナル(サブエージェントの呼び出しも「本体が待機中」という
+    意味では作業中に含めたいため、isSidechainでは絞り込まない)。
+    """
+    for obj in _iter_recent_entries(transcript):
+        message = obj.get("message") or {}
+        return message.get("stop_reason") == "tool_use"
+    return False
 
 
 def _update_usage_and_activity(info: SessionInfo) -> None:
@@ -203,7 +226,8 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
         mtime = transcript.stat().st_mtime
     except OSError:
         mtime = 0.0
-    info.working = (time.time() - mtime) < WORKING_THRESHOLD_SEC
+    mtime_fresh = (time.time() - mtime) < WORKING_THRESHOLD_SEC
+    info.working = mtime_fresh or _is_tool_pending(transcript)
 
     usage = _read_last_usage(transcript)
     if usage:
