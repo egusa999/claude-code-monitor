@@ -489,6 +489,12 @@ function startApp(url) {
   pollTimer = setInterval(() => { refresh(); refreshKickoff(); }, POLL_INTERVAL_MS);
 }
 
+// タブ/ウィンドウが非表示の間はブラウザがsetIntervalを大幅に間引くため、
+// 表示状態に戻ったタイミングで即座に再取得して古い表示のまま放置しない。
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); }
+});
+
 // 初期化: 保存済みアドレスがあれば自動接続、なければ入力フォームを表示
 const saved = localStorage.getItem(STORAGE_KEY);
 if (saved) {

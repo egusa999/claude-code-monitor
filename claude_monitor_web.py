@@ -362,6 +362,11 @@ refresh();
 refreshKickoff();
 setInterval(refresh, __POLL_INTERVAL_MS__);
 setInterval(refreshKickoff, __POLL_INTERVAL_MS__);
+// タブ/ウィンドウが非表示の間はブラウザがsetIntervalを大幅に間引くため、
+// 表示状態に戻ったタイミングで即座に再取得して古い表示のまま放置しない。
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { refresh(); refreshKickoff(); }
+});
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
