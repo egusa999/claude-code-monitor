@@ -435,7 +435,36 @@ const showHiddenBtn = document.getElementById('show-hidden');
 
 // 非表示にしたセッションは一覧から消すのではなく、パネル下部の「非表示中」
 // トレイにまとめておき、個別またはまとめて元に戻せるようにする。
+
+// セッションが終了(プロセス消滅)した後もIDがlocalStorageに残り続けないよう、
+// 現在生存中のセッション一覧に何回連続で現れなかったかを数え、猶予回数を
+// 超えたら自動的にhiddenSessionsから取り除く。1回だけ一覧から消えても
+// 即削除しないのは、meta_fileの読み取りが書き込み中などで一時的に失敗し、
+// 生存中のセッションが1ポーリングだけ一覧から欠落することがあるため
+// (誤って非表示を解除してしまう事故を防ぐ)。
+const HIDDEN_PRUNE_GRACE_POLLS = 3;
+const hiddenMissingStreak = new Map();
+function pruneStaleHiddenSessions(sessions) {
+  const liveIds = new Set(sessions.map(s => s.session_id));
+  let changed = false;
+  for (const id of [...hiddenSessions]) {
+    if (liveIds.has(id)) {
+      hiddenMissingStreak.delete(id);
+      continue;
+    }
+    const streak = (hiddenMissingStreak.get(id) || 0) + 1;
+    if (streak >= HIDDEN_PRUNE_GRACE_POLLS) {
+      hiddenSessions.delete(id);
+      hiddenMissingStreak.delete(id);
+      changed = true;
+    } else {
+      hiddenMissingStreak.set(id, streak);
+    }
+  }
+  if (changed) saveHiddenSessions();
+}
 function renderHiddenTray(sessions) {
+  pruneStaleHiddenSessions(sessions);
   const hidden = sessions.filter(s => hiddenSessions.has(s.session_id));
   if (hidden.length === 0) {
     hiddenTrayEl.hidden = true;
