@@ -148,6 +148,11 @@
     padding: 2px 4px;
   }
   .hidden-chip button:hover { color: var(--text); }
+  .hidden-chip .lamp {
+    width: 8px;
+    height: 8px;
+    flex-shrink: 0;
+  }
   .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px; }
   .bar-wrap { display: flex; align-items: center; gap: 8px; }
   .bar-track {
@@ -439,7 +444,7 @@ function renderHiddenTray(sessions) {
   hiddenTrayEl.hidden = false;
   hiddenCountEl.textContent = hidden.length;
   hiddenChipsEl.innerHTML = hidden.map(s => `
-    <span class="hidden-chip">${escapeHtml(s.name)}<button type="button" class="unhide-btn" data-id="${escapeHtml(s.session_id)}" title="表示に戻す">&#10005;</button></span>
+    <span class="hidden-chip">${escapeHtml(s.name)}<div class="lamp ${s.working ? 'working' : ''}"></div><button type="button" class="unhide-btn" data-id="${escapeHtml(s.session_id)}" title="表示に戻す">&#10005;</button></span>
   `).join('');
 }
 showHiddenBtn.addEventListener('click', () => {
