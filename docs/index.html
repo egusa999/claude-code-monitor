@@ -102,6 +102,52 @@
     border-radius: 4px;
     cursor: pointer;
   }
+  .hidden-tray {
+    border-top: 1px solid var(--border);
+    padding: 10px 14px;
+    background: var(--titlebar);
+  }
+  .hidden-tray-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.03em;
+    margin-bottom: 8px;
+  }
+  .hidden-tray-header button {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 6px;
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .hidden-tray-header button:hover { color: var(--text); border-color: var(--accent); }
+  .hidden-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .hidden-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--track);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 4px 3px 10px;
+  }
+  .hidden-chip button {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 4px;
+  }
+  .hidden-chip button:hover { color: var(--text); }
   .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px; }
   .bar-wrap { display: flex; align-items: center; gap: 8px; }
   .bar-track {
@@ -151,13 +197,10 @@
   .kickoff-titlebar {
     background: var(--titlebar);
     padding: 10px 14px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
     font-weight: 600;
     font-size: 14px;
   }
-  .titlebar button, .kickoff-titlebar button {
+  .titlebar button {
     background: none;
     border: 1px solid var(--border);
     color: var(--text-dim);
@@ -166,7 +209,7 @@
     padding: 3px 8px;
     cursor: pointer;
   }
-  .titlebar button:hover, .kickoff-titlebar button:hover { color: var(--text); border-color: var(--accent); }
+  .titlebar button:hover { color: var(--text); border-color: var(--accent); }
   .kickoff-body {
     display: flex;
     align-items: center;
@@ -260,10 +303,7 @@
 
   <div id="app" hidden style="width:100%;display:flex;flex-direction:column;align-items:center;">
     <div class="kickoff-panel">
-      <div class="kickoff-titlebar">
-        <span>毎朝4時(JST) Hello送信</span>
-        <button id="show-hidden" type="button">非表示をすべて表示</button>
-      </div>
+      <div class="kickoff-titlebar">毎朝4時(JST) Hello送信</div>
       <div class="kickoff-body">
         <div class="kickoff-info" id="kickoff-info">読み込み中...</div>
         <label class="switch">
@@ -281,6 +321,13 @@
         <span>SESSION</span><span>CONTEXT USED</span><span style="text-align:right">STATUS</span>
       </div>
       <div id="rows"></div>
+      <div id="hidden-tray" class="hidden-tray" hidden>
+        <div class="hidden-tray-header">
+          <span>非表示中 (<span id="hidden-count">0</span>)</span>
+          <button id="show-hidden" type="button">すべて戻す</button>
+        </div>
+        <div id="hidden-chips" class="hidden-chips"></div>
+      </div>
     </div>
   </div>
 
@@ -376,19 +423,37 @@ const hiddenSessions = loadHiddenSessions();
 function saveHiddenSessions() {
   try { localStorage.setItem(HIDDEN_STORAGE_KEY, JSON.stringify([...hiddenSessions])); } catch (e) { /* ignore */ }
 }
+const hiddenTrayEl = document.getElementById('hidden-tray');
+const hiddenCountEl = document.getElementById('hidden-count');
+const hiddenChipsEl = document.getElementById('hidden-chips');
 const showHiddenBtn = document.getElementById('show-hidden');
-function updateShowHiddenBtn() {
-  showHiddenBtn.textContent = hiddenSessions.size > 0
-    ? `非表示をすべて表示 (${hiddenSessions.size})`
-    : '非表示をすべて表示';
+
+// 非表示にしたセッションは一覧から消すのではなく、パネル下部の「非表示中」
+// トレイにまとめておき、個別またはまとめて元に戻せるようにする。
+function renderHiddenTray(sessions) {
+  const hidden = sessions.filter(s => hiddenSessions.has(s.session_id));
+  if (hidden.length === 0) {
+    hiddenTrayEl.hidden = true;
+    return;
+  }
+  hiddenTrayEl.hidden = false;
+  hiddenCountEl.textContent = hidden.length;
+  hiddenChipsEl.innerHTML = hidden.map(s => `
+    <span class="hidden-chip">${escapeHtml(s.name)}<button type="button" class="unhide-btn" data-id="${escapeHtml(s.session_id)}" title="表示に戻す">&#10005;</button></span>
+  `).join('');
 }
 showHiddenBtn.addEventListener('click', () => {
   hiddenSessions.clear();
   saveHiddenSessions();
-  updateShowHiddenBtn();
   renderRows(lastLimit, lastSessions);
 });
-updateShowHiddenBtn();
+hiddenChipsEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('.unhide-btn');
+  if (!btn) return;
+  hiddenSessions.delete(btn.dataset.id);
+  saveHiddenSessions();
+  renderRows(lastLimit, lastSessions);
+});
 
 // インストール済みPWA(standaloneウィンドウ)の場合のみ、コンテンツの実サイズに
 // 合わせてウィンドウ自体をリサイズする。通常のブラウザタブでは何もしない
@@ -421,7 +486,7 @@ function fitWindowToContent() {
 }
 
 function renderRows(limit, sessions) {
-  updateShowHiddenBtn();
+  renderHiddenTray(sessions);
   if (sessions.length === 0) {
     rowsEl.innerHTML = '<div class="empty">アクティブなセッションはありません</div>';
     fitWindowToContent();
@@ -429,7 +494,7 @@ function renderRows(limit, sessions) {
   }
   const visible = sessions.filter(s => !hiddenSessions.has(s.session_id));
   if (visible.length === 0) {
-    rowsEl.innerHTML = '<div class="empty">すべてのセッションを非表示にしています(上部の「非表示をすべて表示」から戻せます)</div>';
+    rowsEl.innerHTML = '<div class="empty">表示中のセッションはありません(下の「非表示中」欄から戻せます)</div>';
     fitWindowToContent();
     return;
   }
