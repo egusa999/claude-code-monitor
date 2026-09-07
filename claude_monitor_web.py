@@ -128,7 +128,18 @@ INDEX_HTML = """<!doctype html>
     cursor: pointer;
     user-select: all;
   }
-  .uuid-btn:hover { color: var(--text); border-color: var(--accent); }
+  .uuid-btn:hover, .hide-btn:hover { color: var(--text); border-color: var(--accent); }
+  .hide-btn {
+    font-weight: 400;
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-left: 4px;
+    padding: 1px 6px;
+    background: var(--track);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+  }
   .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px; }
   .bar-wrap { display: flex; align-items: center; gap: 8px; }
   .bar-track {
@@ -178,9 +189,22 @@ INDEX_HTML = """<!doctype html>
   .kickoff-titlebar {
     background: var(--titlebar);
     padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     font-weight: 600;
     font-size: 14px;
   }
+  .kickoff-titlebar button {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  .kickoff-titlebar button:hover { color: var(--text); border-color: var(--accent); }
   .kickoff-body {
     display: flex;
     align-items: center;
@@ -226,7 +250,10 @@ INDEX_HTML = """<!doctype html>
 </head>
 <body>
   <div class="kickoff-panel">
-    <div class="kickoff-titlebar">毎朝4時(JST) Hello送信</div>
+    <div class="kickoff-titlebar">
+      <span>毎朝4時(JST) Hello送信</span>
+      <button id="show-hidden" type="button">非表示をすべて表示</button>
+    </div>
     <div class="kickoff-body">
       <div class="kickoff-info" id="kickoff-info">読み込み中...</div>
       <label class="switch">
@@ -253,18 +280,52 @@ function trimZero(s) {
 }
 const revealedUuids = new Set();
 const rowsEl = document.getElementById('rows');
+const HIDDEN_STORAGE_KEY = 'claudeMonitorHiddenSessions';
+
+// 非表示にしたセッションIDはこの端末(ブラウザ)に保存し、次回起動時も維持する。
+function loadHiddenSessions() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_STORAGE_KEY) || '[]');
+    return new Set(Array.isArray(raw) ? raw : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+const hiddenSessions = loadHiddenSessions();
+function saveHiddenSessions() {
+  try { localStorage.setItem(HIDDEN_STORAGE_KEY, JSON.stringify([...hiddenSessions])); } catch (e) { /* ignore */ }
+}
+const showHiddenBtn = document.getElementById('show-hidden');
+function updateShowHiddenBtn() {
+  showHiddenBtn.textContent = hiddenSessions.size > 0
+    ? `非表示をすべて表示 (${hiddenSessions.size})`
+    : '非表示をすべて表示';
+}
+showHiddenBtn.addEventListener('click', () => {
+  hiddenSessions.clear();
+  saveHiddenSessions();
+  updateShowHiddenBtn();
+  renderRows(lastLimit, lastSessions);
+});
+updateShowHiddenBtn();
 
 function renderRows(limit, sessions) {
+  updateShowHiddenBtn();
   if (sessions.length === 0) {
     rowsEl.innerHTML = '<div class="empty">アクティブなセッションはありません</div>';
     return;
   }
-  rowsEl.innerHTML = sessions.map(s => {
+  const visible = sessions.filter(s => !hiddenSessions.has(s.session_id));
+  if (visible.length === 0) {
+    rowsEl.innerHTML = '<div class="empty">すべてのセッションを非表示にしています(上部の「非表示をすべて表示」から戻せます)</div>';
+    return;
+  }
+  rowsEl.innerHTML = visible.map(s => {
     const id = escapeHtml(s.session_id);
     const uuidLabel = revealedUuids.has(s.session_id) ? id : 'UUID';
     return `
       <div class="row">
-        <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><span class="cwd">${escapeHtml(s.cwd)}</span></div>
+        <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button><span class="cwd">${escapeHtml(s.cwd)}</span></div>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${s.context_pct}%"></div></div>
           <div class="pct">${Math.round(s.context_pct)}% (${formatTokens(s.context_tokens)}/${formatTokens(limit)})</div>
@@ -279,15 +340,23 @@ let lastLimit = 0;
 let lastSessions = [];
 
 rowsEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('.uuid-btn');
-  if (!btn) return;
-  const id = btn.dataset.id;
-  if (revealedUuids.has(id)) {
-    revealedUuids.delete(id);
-  } else {
-    revealedUuids.add(id);
+  const uuidBtn = e.target.closest('.uuid-btn');
+  if (uuidBtn) {
+    const id = uuidBtn.dataset.id;
+    if (revealedUuids.has(id)) {
+      revealedUuids.delete(id);
+    } else {
+      revealedUuids.add(id);
+    }
+    renderRows(lastLimit, lastSessions);
+    return;
   }
-  renderRows(lastLimit, lastSessions);
+  const hideBtn = e.target.closest('.hide-btn');
+  if (hideBtn) {
+    hiddenSessions.add(hideBtn.dataset.id);
+    saveHiddenSessions();
+    renderRows(lastLimit, lastSessions);
+  }
 });
 
 async function refresh() {
