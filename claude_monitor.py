@@ -76,6 +76,7 @@ class SessionInfo:
     context_pct: float = 0.0
     context_tokens: int = 0
     working: bool = False
+    last_active: float = 0.0
 
 
 # セッションごとに直近判明したコンテキストトークン数を保持するキャッシュ。
@@ -259,6 +260,7 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
         info.context_pct = 0.0
         info.context_tokens = 0
         info.working = False
+        info.last_active = info.started_at
         return
 
     try:
@@ -267,6 +269,11 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
         mtime = 0.0
     mtime_fresh = (time.time() - mtime) < WORKING_THRESHOLD_SEC
     info.working = mtime_fresh or _is_awaiting_response(transcript)
+    # 一覧の並び替えに使う「最終アクティブ時刻」。稼働中は、ツール実行に
+    # 時間がかかってmtimeの更新が一時止まっていても「今まさにアクティブ」
+    # として常に最上位に来てほしいため現在時刻を使い、待機中は実際の
+    # トランスクリプト最終更新時刻(mtime)をそのまま使う。
+    info.last_active = time.time() if info.working else mtime
 
     usage = _read_last_usage(transcript)
     if usage:
@@ -303,7 +310,8 @@ def get_sessions() -> list[SessionInfo]:
     sessions = _load_active_sessions()
     for s in sessions:
         _update_usage_and_activity(s)
-    return sessions
+    # 最近アクティブな順(直近に更新があったセッションが常に上)に並べ替える。
+    return sorted(sessions, key=lambda s: s.last_active, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +352,17 @@ class SessionRow(tk.Frame):
             bg=bg, highlightthickness=0,
         )
         self.lamp_canvas.place(x=lamp_x, y=0)
+
+    def update_bg(self, bg: str) -> None:
+        """最近アクティブ順の並べ替えで行の位置(縞模様)が変わったときに、
+        その行と子ウィジェットの背景色を追従させる。"""
+        if bg == self._bg:
+            return
+        self._bg = bg
+        self.config(bg=bg)
+        self.name_label.config(bg=bg)
+        self.bar_canvas.config(bg=bg)
+        self.lamp_canvas.config(bg=bg)
 
     def update_data(self, info: SessionInfo) -> None:
         self.name_label.config(text=info.name)
@@ -484,6 +503,12 @@ class ClaudeMonitorApp:
         else:
             self.empty_label.pack_forget()
 
+        # get_sessions()は最近アクティブ順に並んでいるが、pack()は既存ウィジェットを
+        # 再度呼んでも並び順を変えないため、いったん全行を配置解除してから
+        # 新しい順序で詰め直す(rows dict自体は使い回し、再生成はしない)。
+        for row in self.rows.values():
+            row.pack_forget()
+
         for idx, info in enumerate(sessions):
             row_bg = COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG
             row = self.rows.get(info.session_id)
@@ -491,6 +516,7 @@ class ClaudeMonitorApp:
                 row = SessionRow(self.body, row_bg)
                 self.rows[info.session_id] = row
             row.pack(fill="x")
+            row.update_bg(row_bg)
             row.update_data(info)
 
         row_count = len(sessions) if sessions else 1
