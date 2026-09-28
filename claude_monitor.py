@@ -86,7 +86,14 @@ _last_known_tokens: dict[str, int] = {}
 
 def _is_pid_alive(pid: int) -> bool:
     if os.name == "posix":
-        return Path(f"/proc/{pid}").exists()
+        status_path = Path(f"/proc/{pid}/status")
+        try:
+            for line in status_path.read_text().splitlines():
+                if line.startswith("Tgid:"):
+                    return int(line.split()[1]) == pid
+        except (FileNotFoundError, ProcessLookupError, ValueError):
+            return False
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -172,7 +179,7 @@ def _iter_recent_entries(transcript: Path):
                 continue
             try:
                 yield json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
         if tail_size >= size or tail_size >= TRANSCRIPT_MAX_SCAN_BYTES:
