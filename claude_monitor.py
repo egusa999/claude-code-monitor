@@ -101,6 +101,54 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
+# /proc/<pid>/stat のフィールド番号(man proc(5)参照)。フィールド2の comm
+# (プロセス名)は空白や閉じ括弧を含みうるため、最後の ")" より後ろをフィールド3
+# (state)起点として数える必要がある。
+_STAT_STARTTIME_FIELD_NUMBER = 22
+_STAT_FIELD_NUMBER_AFTER_COMM_START = 3
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    """/proc/<pid>/stat の starttime(システム起動からのクロックtick数)を返す。
+    取得できなければNone。"""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    parts = raw.rsplit(")", 1)
+    if len(parts) != 2:
+        return None
+    fields_after_comm = parts[1].split()
+    index = _STAT_STARTTIME_FIELD_NUMBER - _STAT_FIELD_NUMBER_AFTER_COMM_START
+    try:
+        return int(fields_after_comm[index])
+    except (IndexError, ValueError):
+        return None
+
+
+def _is_same_process_instance(pid: int, recorded_start_ticks: int | None) -> bool:
+    """PIDが生存しているだけでなく、~/.claude/sessions/<pid>.jsonに記録された
+    起動時刻(procStart)と、現在そのPIDで動いているプロセスの実際の起動時刻が
+    一致する、同一プロセスインスタンスかどうかを確認する。
+
+    理由: プロセスが終了した後、OSが同じPID番号を全く無関係な別プロセスへ
+    再利用することがある。生死判定(_is_pid_alive)だけでは、既に終了した
+    セッションの残骸ファイルを、たまたまPID番号を引き継いだ無関係な新しい
+    プロセスのせいで「生存中」と誤判定してしまう不具合が実際に起きた
+    (2026-09-28、実データで再現確認)。recorded_start_ticksが取得できない
+    (procStartフィールドを持たない古い形式のセッションファイル等)場合は、
+    この照合をスキップし_is_pid_aliveの結果のみで判定する(後方互換)。
+    """
+    if not _is_pid_alive(pid):
+        return False
+    if recorded_start_ticks is None:
+        return True
+    actual_start_ticks = _process_start_ticks(pid)
+    if actual_start_ticks is None:
+        return True
+    return actual_start_ticks == recorded_start_ticks
+
+
 def _load_active_sessions() -> list[SessionInfo]:
     """~/.claude/sessions/*.json から、プロセスが生存中のセッションのみ返す。"""
     sessions: dict[str, SessionInfo] = {}
@@ -112,11 +160,20 @@ def _load_active_sessions() -> list[SessionInfo]:
             pid = int(meta_file.stem)
         except ValueError:
             continue
-        if not _is_pid_alive(pid):
-            continue
         try:
             data = json.loads(meta_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            continue
+
+        recorded_start_ticks: int | None = None
+        raw_proc_start = data.get("procStart")
+        if raw_proc_start is not None:
+            try:
+                recorded_start_ticks = int(raw_proc_start)
+            except (TypeError, ValueError):
+                recorded_start_ticks = None
+
+        if not _is_same_process_instance(pid, recorded_start_ticks):
             continue
 
         session_id = data.get("sessionId")
