@@ -206,6 +206,7 @@ INDEX_HTML = """<!doctype html>
     border-radius: 4px;
     transition: width 0.4s ease;
   }
+  .model { font-size: 10px; color: var(--text-dim); white-space: nowrap; }
   .pct { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .status { display: flex; justify-content: flex-end; }
   .lamp {
@@ -417,7 +418,10 @@ function renderRows(limit, sessions) {
         <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button><span class="cwd">${escapeHtml(s.cwd)}</span></div>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${s.context_pct}%"></div></div>
-          <div class="pct">${Math.round(s.context_pct)}% (${formatTokens(s.context_tokens)}/${formatTokens(limit)})</div>
+          <div class="pct-wrap">
+            ${s.model ? `<div class="model">${escapeHtml(s.model)}</div>` : ''}
+            <div class="pct">${Math.round(s.context_pct)}% (${formatTokens(s.context_tokens)}/${formatTokens(s.context_limit || limit)})</div>
+          </div>
         </div>
         <div class="status"><div class="lamp ${s.working ? 'working' : ''}"></div></div>
       </div>

@@ -40,6 +40,15 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 # で上書きできるようにしている。/context コマンドの表示(例: "96.6k / 1m")の
 # 右側の数字に合わせて設定すること。
 CONTEXT_TOKEN_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_TOKEN_LIMIT", "1000000"))
+# モデルIDの接頭辞 → コンテキストウィンドウ(トークン)。トランスクリプトには上限値そのものが
+# 記録されないため、各行の message.model から推定する。長い接頭辞を優先して照合する。
+# 表に無いモデルは上記 CONTEXT_TOKEN_LIMIT(全体の既定値)にフォールバックする。
+MODEL_CONTEXT_LIMITS: dict[str, int] = {
+    "claude-fable-5-1": 1_000_000,
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5-5": 1_000_000,
+    "claude-haiku-4-5": 200_000,
+}
 WORKING_THRESHOLD_SEC = 6.0         # この秒数以内にトランスクリプト更新があれば「作業中」
 AWAITING_PROMPT_MAX_AGE_SEC = 180.0  # 新規プロンプト/ツール結果を「考え中」とみなす最大経過時間
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
@@ -75,6 +84,8 @@ class SessionInfo:
     started_at: float
     context_pct: float = 0.0
     context_tokens: int = 0
+    context_limit: int = 0
+    model: str = ""
     working: bool = False
     last_active: float = 0.0
 
@@ -82,6 +93,8 @@ class SessionInfo:
 # セッションごとに直近判明したコンテキストトークン数を保持するキャッシュ。
 # SessionInfoは毎ポーリングで作り直されるため、この値はモジュールレベルで持つ。
 _last_known_tokens: dict[str, int] = {}
+_last_known_limit: dict[str, int] = {}
+_last_known_model: dict[str, str] = {}
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -244,8 +257,16 @@ def _iter_recent_entries(transcript: Path):
         tail_size = min(tail_size * 4, TRANSCRIPT_MAX_SCAN_BYTES, size)
 
 
-def _read_last_usage(transcript: Path) -> dict | None:
-    """トランスクリプト末尾から、メインチェーンの最後の usage オブジェクトを取得する。
+def _context_limit_for_model(model: str | None) -> int:
+    if model:
+        for prefix in sorted(MODEL_CONTEXT_LIMITS, key=len, reverse=True):
+            if model.startswith(prefix):
+                return MODEL_CONTEXT_LIMITS[prefix]
+    return CONTEXT_TOKEN_LIMIT
+
+
+def _read_last_usage(transcript: Path) -> tuple[dict, str | None] | None:
+    """トランスクリプト末尾から、メインチェーンの最後の (usage, model) を取得する。
 
     Task(サブエージェント)呼び出しは isSidechain: true として同じファイルに
     記録され、メインの会話とは無関係な(別のコンテキストウィンドウの)トークン数
@@ -262,7 +283,7 @@ def _read_last_usage(transcript: Path) -> dict | None:
             continue
         usage = message.get("usage")
         if usage:
-            return usage
+            return usage, message.get("model")
     return None
 
 
@@ -323,6 +344,7 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
     if transcript is None:
         info.context_pct = 0.0
         info.context_tokens = 0
+        info.context_limit = CONTEXT_TOKEN_LIMIT
         info.working = False
         info.last_active = info.started_at
         return
@@ -339,8 +361,12 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
     # トランスクリプト最終更新時刻(mtime)をそのまま使う。
     info.last_active = time.time() if info.working else mtime
 
-    usage = _read_last_usage(transcript)
-    if usage:
+    result = _read_last_usage(transcript)
+    if result:
+        usage, model = result
+        _last_known_limit[info.session_id] = _context_limit_for_model(model)
+        if model:
+            _last_known_model[info.session_id] = model
         tokens = (
             usage.get("input_tokens", 0)
             + usage.get("cache_creation_input_tokens", 0)
@@ -352,8 +378,11 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
         # 0に落とすとアクティブ中に瞬間的な0表示が起きるため、直近の既知値を保持する。
         tokens = _last_known_tokens.get(info.session_id, 0)
 
+    limit = _last_known_limit.get(info.session_id, CONTEXT_TOKEN_LIMIT)
     info.context_tokens = tokens
-    info.context_pct = min(100.0, tokens / CONTEXT_TOKEN_LIMIT * 100.0)
+    info.context_limit = limit
+    info.model = _last_known_model.get(info.session_id, "")
+    info.context_pct = min(100.0, tokens / limit * 100.0)
 
 
 def format_tokens(n: int) -> str:
@@ -448,11 +477,15 @@ class SessionRow(tk.Frame):
 
         label = (
             f"{info.context_pct:.0f}% "
-            f"({format_tokens(info.context_tokens)}/{format_tokens(CONTEXT_TOKEN_LIMIT)})"
+            f"({format_tokens(info.context_tokens)}/{format_tokens(info.context_limit)})"
         )
-        c.create_text(track_w + 10, (track_y0 + track_y1) // 2,
+        c.create_text(track_w + 10, (track_y0 + track_y1) // 2 + 6,
                        text=label, fill=COLOR_TEXT, anchor="w",
                        font=("Segoe UI", 9, "bold"))
+        if info.model:
+            c.create_text(track_w + 10, (track_y0 + track_y1) // 2 - 8,
+                           text=info.model, fill=COLOR_TEXT_DIM, anchor="w",
+                           font=("Segoe UI", 8))
 
     def _draw_lamp(self) -> None:
         c = self.lamp_canvas
