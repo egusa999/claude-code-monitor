@@ -20,9 +20,12 @@ PWA対応(manifest/アイコン/Service Worker)により、セキュアコンテ
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import ssl
 import subprocess
+import sys
+from pathlib import Path
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -37,6 +40,13 @@ except ImportError:
 
 POLL_INTERVAL_MS = 1500  # ブラウザ側のポーリング間隔(claude_monitor.pyと合わせる)
 BLINK_INTERVAL_MS = 500
+
+DEFAULT_TOKEN_FILE = "/etc/claude-monitor/token"  # /api/* に必須のBearerトークンを1行で保存
+API_PATH_PREFIX = "/api/"
+BEARER_PREFIX = "Bearer "
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+MIN_TOKEN_LENGTH = 32  # これ未満のトークンは推測されやすいので起動を拒否する
+HTTP_UNAUTHORIZED = 401
 
 INDEX_HTML = """<!doctype html>
 <html lang="ja">
@@ -323,7 +333,31 @@ function trimZero(s) {
 }
 const revealedUuids = new Set();
 const rowsEl = document.getElementById('rows');
+const TOKEN_STORAGE_KEY = 'claudeMonitorToken';
 const HIDDEN_STORAGE_KEY = 'claudeMonitorHiddenSessions';
+
+// /api/* はBearerトークン必須。トークンは端末ごとにlocalStorageへ保存し、401なら入力を求めて1回だけ再試行する。
+function loadToken() {
+  try { return localStorage.getItem(TOKEN_STORAGE_KEY) || ''; } catch (e) { return ''; }
+}
+let tokenPromptOpen = false;
+async function apiFetch(path, options = {}) {
+  const send = () => fetch(path, {
+    ...options,
+    headers: { ...(options.headers || {}), 'Authorization': 'Bearer ' + loadToken() },
+  });
+  let res = await send();
+  if (res.status === 401 && !tokenPromptOpen) {
+    tokenPromptOpen = true;
+    const input = window.prompt('アクセストークンを入力してください(サーバーの /etc/claude-monitor/token)');
+    tokenPromptOpen = false;
+    if (input) {
+      try { localStorage.setItem(TOKEN_STORAGE_KEY, input.trim()); } catch (e) { /* ignore */ }
+      res = await send();
+    }
+  }
+  return res;
+}
 
 // 非表示にしたセッションIDはこの端末(ブラウザ)に保存し、次回起動時も維持する。
 function loadHiddenSessions() {
@@ -454,7 +488,8 @@ rowsEl.addEventListener('click', (e) => {
 
 async function refresh() {
   try {
-    const res = await fetch('/api/sessions');
+    const res = await apiFetch('/api/sessions');
+    if (!res.ok) throw new Error('unauthorized or offline');
     const data = await res.json();
     lastLimit = data.context_limit;
     lastSessions = data.sessions;
@@ -492,7 +527,7 @@ function renderKickoff(state) {
 async function refreshKickoff() {
   if (kickoffSyncing) return;
   try {
-    const res = await fetch('/api/kickoff');
+    const res = await apiFetch('/api/kickoff');
     if (!res.ok) throw new Error('kickoff status unavailable');
     renderKickoff(await res.json());
   } catch (e) {
@@ -505,7 +540,7 @@ kickoffToggle.addEventListener('change', async () => {
   const enabled = kickoffToggle.checked;
   kickoffToggle.disabled = true;
   try {
-    const res = await fetch('/api/kickoff/toggle', {
+    const res = await apiFetch('/api/kickoff/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled }),
@@ -587,11 +622,42 @@ def _kickoff_state_payload() -> dict:
     return state
 
 
+def load_token(path: str) -> str | None:
+    """トークンファイルを読む。無ければNone。短すぎる/空のトークンはValueError。"""
+    file = Path(path)
+    if not file.is_file():
+        return None
+    token = file.read_text(encoding="utf-8").strip()
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise ValueError(f"{path} のトークンが短すぎます({MIN_TOKEN_LENGTH}文字以上にしてください)")
+    return token
+
+
 class MonitorHandler(BaseHTTPRequestHandler):
+    token: str | None = None  # Noneなら認証なし(ループバック待受のときのみ許可。main()で検証)
+
+    def _authorized(self) -> bool:
+        if self.token is None:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith(BEARER_PREFIX):
+            return False
+        return hmac.compare_digest(header[len(BEARER_PREFIX):].strip().encode("utf-8"),
+                                   self.token.encode("utf-8"))
+
+    def _reject_if_unauthorized(self) -> bool:
+        """/api/* でトークンが無い・違う場合は401を返してTrueを返す。"""
+        if not self.path.startswith(API_PATH_PREFIX) or self._authorized():
+            return False
+        self._send(HTTP_UNAUTHORIZED, b'{"error":"unauthorized"}', "application/json; charset=utf-8", cors=True)
+        return True
+
     def log_message(self, format: str, *args) -> None:
         pass  # アクセスログは静かに抑制
 
     def do_GET(self) -> None:
+        if self._reject_if_unauthorized():
+            return
         if self.path in ("/", "/index.html"):
             self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/sessions":
@@ -616,6 +682,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
+        if self._reject_if_unauthorized():
+            return
         if self.path == "/api/kickoff/toggle":
             if daily_kickoff is None:
                 self._send(503, b'{"error":"daily_kickoff module not found"}',
@@ -640,7 +708,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self.send_response(204)
             self._write_cors_headers()
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.send_header("Content-Length", "0")
             self.end_headers()
         else:
@@ -648,8 +716,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _write_cors_headers(self) -> None:
         # PWAシェル(GitHub Pages等、別オリジン)からこのAPIを呼べるようにする。
-        # 公開しているのはセッション名・作業ディレクトリ・コンテキスト使用率のみで、
-        # 認証トークンや機密情報は扱わないため、オリジン制限はかけていない。
+        # /api/* はBearerトークン必須(_reject_if_unauthorized)。トークンがCookieではなく
+        # Authorizationヘッダーで渡るため、Origin: * でもCSRF経由では読めない。
         self.send_header("Access-Control-Allow-Origin", "*")
 
     def _send(self, status: int, body: bytes, content_type: str, cors: bool = False) -> None:
@@ -671,6 +739,9 @@ def main() -> None:
                          help="TLS証明書ファイル(.crt/.pem)。指定するとHTTPSで待受(例: tailscale certで発行したもの)")
     parser.add_argument("--key", default=None,
                          help="TLS秘密鍵ファイル(.key)。--certとセットで指定")
+    parser.add_argument("--token-file", default=DEFAULT_TOKEN_FILE,
+                         help=f"/api/* 用Bearerトークンのファイル(既定: {DEFAULT_TOKEN_FILE})。"
+                              "ループバック以外で待受ける場合は必須(無ければ起動しない)")
     parser.add_argument("--context-limit", type=int, default=None,
                          help="コンテキストウィンドウの上限トークン数(既定: 環境変数 "
                               "CLAUDE_CONTEXT_TOKEN_LIMIT、未設定なら1,000,000)。"
@@ -679,6 +750,14 @@ def main() -> None:
 
     if args.context_limit is not None:
         claude_monitor.CONTEXT_TOKEN_LIMIT = args.context_limit
+
+    try:
+        MonitorHandler.token = load_token(args.token_file)
+    except ValueError as e:
+        sys.exit(str(e))
+    if MonitorHandler.token is None and args.host not in LOOPBACK_HOSTS:
+        sys.exit(f"認証トークンがありません: {args.token_file} を作成してください"
+                 "(ループバック以外で認証なしの公開はしません)")
 
     server = ThreadingHTTPServer((args.host, args.port), MonitorHandler)
     scheme = "http"

@@ -303,6 +303,7 @@
       一度指定すれば、次回からはこの端末で自動的に接続します。
     </p>
     <input id="setup-input" type="text" placeholder="例: 192.168.1.10:8765" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <input id="setup-token" type="password" style="margin-top:8px" placeholder="アクセストークン" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
     <div class="error" id="setup-error"></div>
     <button id="setup-submit" type="button">接続する</button>
   </div>
@@ -339,11 +340,13 @@
 
 <script>
 const STORAGE_KEY = 'claudeMonitorServerAddress';
+const TOKEN_STORAGE_KEY = 'claudeMonitorToken';
 const HIDDEN_STORAGE_KEY = 'claudeMonitorHiddenSessions';
 const POLL_INTERVAL_MS = 1500;
 
 const setupEl = document.getElementById('setup');
 const setupInput = document.getElementById('setup-input');
+const setupToken = document.getElementById('setup-token');
 const setupError = document.getElementById('setup-error');
 const setupSubmit = document.getElementById('setup-submit');
 const appEl = document.getElementById('app');
@@ -352,6 +355,17 @@ const changeAddressBtn = document.getElementById('change-address');
 const rowsEl = document.getElementById('rows');
 
 let baseUrl = null;
+
+// /api/* はBearerトークン必須。トークンは端末ごとにlocalStorageへ保存する。
+function loadToken() {
+  try { return localStorage.getItem(TOKEN_STORAGE_KEY) || ''; } catch (e) { return ''; }
+}
+function apiFetch(url, options = {}) {
+  return fetch(url, {
+    ...options,
+    headers: { ...(options.headers || {}), 'Authorization': 'Bearer ' + loadToken() },
+  });
+}
 let pollTimer = null;
 
 function normalizeAddress(raw) {
@@ -376,6 +390,7 @@ function showSetup(prefill) {
   appEl.hidden = true;
   setupEl.hidden = false;
   setupInput.value = prefill || '';
+  setupToken.value = loadToken();
   setupError.textContent = '';
   setupInput.focus();
   lastFitHeight = 0;
@@ -392,7 +407,15 @@ async function tryConnect(address) {
   setupSubmit.disabled = true;
   setupError.textContent = '接続確認中...';
   try {
-    const res = await fetch(url + '/api/sessions', { cache: 'no-store' });
+    const res = await fetch(url + '/api/sessions', {
+      cache: 'no-store',
+      headers: { 'Authorization': 'Bearer ' + setupToken.value.trim() },
+    });
+    if (res.status === 401) {
+      setupError.textContent = 'アクセストークンが正しくありません';
+      setupSubmit.disabled = false;
+      return;
+    }
     if (!res.ok) throw new Error('unexpected status ' + res.status);
     await res.json();
   } catch (e) {
@@ -401,12 +424,14 @@ async function tryConnect(address) {
     return;
   }
   localStorage.setItem(STORAGE_KEY, url);
+  localStorage.setItem(TOKEN_STORAGE_KEY, setupToken.value.trim());
   setupSubmit.disabled = false;
   startApp(url);
 }
 
 setupSubmit.addEventListener('click', () => tryConnect(setupInput.value));
 setupInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryConnect(setupInput.value); });
+setupToken.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryConnect(setupInput.value); });
 changeAddressBtn.addEventListener('click', () => {
   const saved = localStorage.getItem(STORAGE_KEY) || '';
   showSetup(saved.replace(/^https?:\/\//, ''));
@@ -571,7 +596,7 @@ rowsEl.addEventListener('click', (e) => {
 
 async function refresh() {
   try {
-    const res = await fetch(baseUrl + '/api/sessions', { cache: 'no-store' });
+    const res = await apiFetch(baseUrl + '/api/sessions', { cache: 'no-store' });
     if (!res.ok) throw new Error('offline');
     const data = await res.json();
     lastLimit = data.context_limit;
@@ -609,7 +634,7 @@ function renderKickoff(state) {
 async function refreshKickoff() {
   if (kickoffSyncing) return;
   try {
-    const res = await fetch(baseUrl + '/api/kickoff', { cache: 'no-store' });
+    const res = await apiFetch(baseUrl + '/api/kickoff', { cache: 'no-store' });
     if (!res.ok) throw new Error('kickoff status unavailable');
     renderKickoff(await res.json());
   } catch (e) {
@@ -622,7 +647,7 @@ kickoffToggle.addEventListener('change', async () => {
   const enabled = kickoffToggle.checked;
   kickoffToggle.disabled = true;
   try {
-    const res = await fetch(baseUrl + '/api/kickoff/toggle', {
+    const res = await apiFetch(baseUrl + '/api/kickoff/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled }),
