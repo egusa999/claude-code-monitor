@@ -371,7 +371,9 @@ let pollTimer = null;
 function normalizeAddress(raw) {
   let v = raw.trim();
   if (!v) return null;
-  if (!/^https?:\/\//i.test(v)) v = 'http://' + v;
+  // スキーム省略時: 実運用サーバーはTLS(https)。HTTPSのPWAからhttpへは混在コンテンツで接続できないため、
+  // SSHトンネル経由のlocalhost系だけhttp、それ以外はhttpsを既定にする。
+  if (!/^https?:\/\//i.test(v)) v = (/^(localhost|127\.0\.0\.1)(:|$)/i.test(v) ? 'http://' : 'https://') + v;
   return v.replace(/\/+$/, '');
 }
 
