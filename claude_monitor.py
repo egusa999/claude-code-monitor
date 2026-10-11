@@ -22,7 +22,7 @@ import json
 import os
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,6 +52,9 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
 WORKING_THRESHOLD_SEC = 6.0         # この秒数以内にトランスクリプト更新があれば「作業中」
 AWAITING_PROMPT_MAX_AGE_SEC = 180.0  # 新規プロンプト/ツール結果を「考え中」とみなす最大経過時間
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
+AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
+SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
+AGENT_FILE_GLOB = "agent-*.jsonl"
 BLINK_INTERVAL_MS = 500             # 赤ランプの点滅間隔
 TRANSCRIPT_TAIL_BYTES = 65536        # トランスクリプト末尾読み取りの初期サイズ
 TRANSCRIPT_MAX_SCAN_BYTES = 8 * 1024 * 1024  # 見つからない場合に拡大する上限(8MB)
@@ -76,6 +79,21 @@ COLOR_GREEN = "#3ddc84"
 # ---------------------------------------------------------------------------
 
 @dataclass
+class AgentInfo:
+    """親セッションの中で動くサブエージェント(fork・Explore・general-purpose等)。
+    別プロセスではないため sessions/*.json は無く、親セッション配下の subagents/ に記録される。"""
+    agent_id: str
+    agent_type: str = ""
+    description: str = ""
+    is_fork: bool = False
+    model: str = ""
+    context_tokens: int = 0
+    context_limit: int = 0
+    context_pct: float = 0.0
+    working: bool = False
+
+
+@dataclass
 class SessionInfo:
     pid: int
     session_id: str
@@ -88,6 +106,7 @@ class SessionInfo:
     model: str = ""
     working: bool = False
     last_active: float = 0.0
+    agents: list[AgentInfo] = field(default_factory=list)
 
 
 # セッションごとに直近判明したコンテキストトークン数を保持するキャッシュ。
@@ -265,15 +284,17 @@ def _context_limit_for_model(model: str | None) -> int:
     return CONTEXT_TOKEN_LIMIT
 
 
-def _read_last_usage(transcript: Path) -> tuple[dict, str | None] | None:
+def _read_last_usage(transcript: Path, include_sidechain: bool = False) -> tuple[dict, str | None] | None:
     """トランスクリプト末尾から、メインチェーンの最後の (usage, model) を取得する。
 
     Task(サブエージェント)呼び出しは isSidechain: true として同じファイルに
     記録され、メインの会話とは無関係な(別のコンテキストウィンドウの)トークン数
     を持つため、必ず除外する。これを除外しないと /context の表示と一致しなくなる。
+    サブエージェント自身のトランスクリプト(全行が isSidechain: true)を読むときだけ
+    include_sidechain=True にする。
     """
     for obj in _iter_recent_entries(transcript):
-        if obj.get("isSidechain"):
+        if obj.get("isSidechain") and not include_sidechain:
             continue
         message = obj.get("message") or {}
         if message.get("model") == "<synthetic>":
@@ -347,6 +368,7 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
         info.context_limit = CONTEXT_TOKEN_LIMIT
         info.working = False
         info.last_active = info.started_at
+        info.agents = []
         return
 
     try:
@@ -383,6 +405,59 @@ def _update_usage_and_activity(info: SessionInfo) -> None:
     info.context_limit = limit
     info.model = _last_known_model.get(info.session_id, "")
     info.context_pct = min(100.0, tokens / limit * 100.0)
+    info.agents = _load_agents(transcript)
+
+
+def _read_agent_meta(agent_file: Path) -> dict:
+    try:
+        return json.loads(agent_file.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+
+def _load_agents(parent_transcript: Path) -> list[AgentInfo]:
+    """親セッション配下のサブエージェントのうち、作業中または直近に更新があったものを返す。
+
+    種類(fork / Explore / general-purpose等)を問わず全て対象。完了後もファイルは残り続けるため、
+    AGENT_VISIBLE_SEC を過ぎたものは出さない。コンテキスト量は各エージェント自身のトランスクリプトの
+    最後のusageから求める(親とは別のコンテキストウィンドウ。forkは親の会話を引き継いで始まる)。
+    """
+    agents_dir = parent_transcript.parent / parent_transcript.stem / SUBAGENTS_DIRNAME
+    agents: list[AgentInfo] = []
+    now = time.time()
+    for agent_file in agents_dir.glob(AGENT_FILE_GLOB):
+        try:
+            age = now - agent_file.stat().st_mtime
+        except OSError:
+            continue
+        working = age < WORKING_THRESHOLD_SEC or (age < AGENT_VISIBLE_SEC and _is_awaiting_response(agent_file))
+        if not working and age >= AGENT_VISIBLE_SEC:
+            continue
+        meta = _read_agent_meta(agent_file)
+        agent_id = agent_file.stem.removeprefix("agent-")
+        result = _read_last_usage(agent_file, include_sidechain=True)
+        if result:
+            usage, model = result
+            tokens = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                      + usage.get("cache_read_input_tokens", 0))
+            _last_known_tokens[agent_id] = tokens
+            _last_known_limit[agent_id] = _context_limit_for_model(model)
+            if model:
+                _last_known_model[agent_id] = model
+        tokens = _last_known_tokens.get(agent_id, 0)
+        limit = _last_known_limit.get(agent_id, CONTEXT_TOKEN_LIMIT)
+        agents.append(AgentInfo(
+            agent_id=agent_id,
+            agent_type=meta.get("agentType", ""),
+            description=meta.get("description", ""),
+            is_fork=bool(meta.get("isFork")),
+            model=_last_known_model.get(agent_id, ""),
+            context_tokens=tokens,
+            context_limit=limit,
+            context_pct=min(100.0, tokens / limit * 100.0),
+            working=working,
+        ))
+    return sorted(agents, key=lambda a: (not a.working, a.agent_id))
 
 
 def format_tokens(n: int) -> str:
