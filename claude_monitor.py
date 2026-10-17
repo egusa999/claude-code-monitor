@@ -184,6 +184,8 @@ def _is_same_process_instance(pid: int, recorded_start_ticks: int | None) -> boo
 def _load_active_sessions() -> list[SessionInfo]:
     """~/.claude/sessions/*.json から、プロセスが生存中のセッションのみ返す。"""
     sessions: dict[str, SessionInfo] = {}
+    parked_job_ids: dict[str, str] = {}  # session_id -> parkedJobId(退避中の親)
+    live_bg_job_ids: set[str] = set()    # 生存中のbgセッションのjobId
     if not SESSIONS_DIR.exists():
         return []
 
@@ -227,6 +229,17 @@ def _load_active_sessions() -> list[SessionInfo]:
         existing = sessions.get(session_id)
         if existing is None or started_at >= existing.started_at:
             sessions[session_id] = info
+            if data.get("parkedJobId"):
+                parked_job_ids[session_id] = str(data["parkedJobId"])
+            if data.get("kind") == "bg" and data.get("jobId"):
+                live_bg_job_ids.add(str(data["jobId"]))
+
+    # 親セッションがbgジョブへ退避(park)され、そのbgが生存中なら、親は隠してbg側の
+    # 1行だけ残す(Claude本体のセッションマネージャーと同じ見え方)。bgが終了すれば
+    # live_bg_job_idsに入らないので、親は通常どおり再表示される。
+    for sid, job_id in parked_job_ids.items():
+        if job_id in live_bg_job_ids:
+            sessions.pop(sid, None)
 
     return sorted(sessions.values(), key=lambda s: s.started_at)
 
