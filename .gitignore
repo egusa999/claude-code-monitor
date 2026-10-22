@@ -23,3 +23,6 @@ narrative_archive.md
 next_session_prompt.txt
 session_start_prompt.txt
 session_end_prompt.txt
+
+# gh認証情報の誤生成(HOME未設定時)
+.config/
