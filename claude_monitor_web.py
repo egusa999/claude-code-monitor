@@ -239,6 +239,16 @@ INDEX_HTML = """<!doctype html>
     0%, 49% { background: var(--red-on); }
     50%, 100% { background: var(--red-off); }
   }
+  .conn-error {
+    width: 100%;
+    max-width: 560px;
+    margin-bottom: 10px;
+    color: #ff4d4d;
+    font-weight: bold;
+    font-size: 14px;
+    text-align: center;
+  }
+  .conn-error[hidden] { display: none; }
   .empty {
     padding: 24px 14px;
     text-align: center;
@@ -304,6 +314,7 @@ INDEX_HTML = """<!doctype html>
 </style>
 </head>
 <body>
+  <div id="conn-error" class="conn-error" hidden>サーバーに接続できません(起動状態・アドレスを確認してください)</div>
   <div class="kickoff-panel">
     <div class="kickoff-titlebar">毎朝4時(JST) Hello送信</div>
     <div class="kickoff-body">
@@ -503,6 +514,8 @@ rowsEl.addEventListener('click', (e) => {
   }
 });
 
+const connErrorEl = document.getElementById('conn-error');
+
 async function refresh() {
   try {
     const res = await apiFetch('/api/sessions');
@@ -511,8 +524,10 @@ async function refresh() {
     lastLimit = data.context_limit;
     lastSessions = data.sessions;
     renderRows(lastLimit, lastSessions);
+    connErrorEl.hidden = true;
   } catch (e) {
     console.error(e);
+    connErrorEl.hidden = false;
   }
 }
 function escapeHtml(str) {
