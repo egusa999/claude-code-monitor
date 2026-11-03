@@ -18,14 +18,19 @@ Claude Code Monitor
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass, field
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,6 +59,12 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
 }
 WORKING_THRESHOLD_SEC = 6.0         # この秒数以内にトランスクリプト更新があれば「作業中」
 AWAITING_PROMPT_MAX_AGE_SEC = 180.0  # 新規プロンプト/ツール結果を「考え中」とみなす最大経過時間
+DEFAULT_SSH_HOST = "root@claudecode"  # リモートモードで端末を開くときのSSH接続先
+REMOTE_FETCH_TIMEOUT_SEC = 5          # サーバーAPIの応答待ち上限
+TOKEN_ENV_VAR = "CLAUDE_MONITOR_TOKEN"
+COLOR_ERROR = "#ff4d4d"
+# リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
+ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
 SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
@@ -525,12 +536,18 @@ _POSIX_TERMINALS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def open_terminal(attach_cmd: str) -> bool:
+def open_terminal(attach_cmd: str, ssh_host: str | None = None) -> bool:
     """attach_cmd(`tmux attach -t =名` / `claude attach <id>`)を新しい端末で実行する。
-    起動できる端末が無い・起動に失敗したときは False を返す。"""
+    ssh_host指定時(リモートモード)は`ssh -t <host> <attach_cmd>`として手元の端末で開く。
+    起動できる端末が無い・コマンド形式が不正・起動に失敗したときは False を返す。"""
     if not attach_cmd:
         return False
-    argv = shlex.split(attach_cmd)
+    if ssh_host:
+        if not ATTACH_CMD_PATTERN.match(attach_cmd):
+            return False
+        argv = ["ssh", "-t", ssh_host, attach_cmd]
+    else:
+        argv = shlex.split(attach_cmd)
     try:
         if os.name == "nt":
             terminal = ["wt.exe"] if shutil.which("wt.exe") else ["cmd.exe", "/c", "start", ""]
@@ -543,6 +560,47 @@ def open_terminal(attach_cmd: str) -> bool:
     except OSError:
         return False
     return False
+
+
+class RemoteSessionSource:
+    """サーバーのWeb版(`/api/sessions`)からセッション一覧を取得する。
+    ネットワーク待ちでGUIを固めないよう、取得は別スレッドで周期実行し、get()は最新結果を返す。"""
+
+    def __init__(self, base_url: str, token: str):
+        self._url = base_url.rstrip("/") + "/api/sessions"
+        self._token = token
+        self._lock = threading.Lock()
+        self._sessions: list[SessionInfo] = []
+        self._error: str | None = "接続中..."
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _fetch(self) -> list[SessionInfo]:
+        req = urllib.request.Request(
+            self._url, headers={"Authorization": f"Bearer {self._token}"})
+        with urllib.request.urlopen(req, timeout=REMOTE_FETCH_TIMEOUT_SEC) as res:
+            payload = json.load(res)
+        names = {f.name for f in fields(SessionInfo)} - {"agents"}
+        return [SessionInfo(**{k: v for k, v in item.items() if k in names})
+                for item in payload["sessions"]]
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                sessions, error = self._fetch(), None
+            except urllib.error.HTTPError as e:
+                sessions, error = None, "トークンが無効です" if e.code == 401 else f"HTTP {e.code}"
+            except (OSError, ValueError, KeyError, TypeError):
+                sessions, error = None, "サーバーに接続できません"
+            with self._lock:
+                if sessions is not None:
+                    self._sessions = sessions
+                self._error = error
+            time.sleep(POLL_INTERVAL_MS / 1000.0)
+
+    def get(self) -> tuple[list[SessionInfo], str | None]:
+        """(直近に取得できた一覧, 接続エラー文言またはNone)。"""
+        with self._lock:
+            return list(self._sessions), self._error
 
 
 # ---------------------------------------------------------------------------
@@ -559,8 +617,9 @@ class SessionRow(tk.Frame):
     LAMP_SIZE = 16
     TERM_BUTTON_WIDTH = 34
 
-    def __init__(self, master: tk.Widget, bg: str):
+    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn=None):
         super().__init__(master, bg=bg, height=self.ROW_HEIGHT)
+        self._open_terminal_fn = open_terminal_fn or open_terminal
         self.pack_propagate(False)
         self._bg = bg
         self._blink_on = True
@@ -594,7 +653,7 @@ class SessionRow(tk.Frame):
         self._term_button_x = lamp_x + self.LAMP_SIZE + 8 + 6
 
     def _on_terminal(self) -> None:
-        if not open_terminal(self._attach_cmd):
+        if not self._open_terminal_fn(self._attach_cmd):
             self.term_button.config(text="失敗")
             self.after(1500, lambda: self.term_button.config(text="端末"))
 
@@ -662,8 +721,11 @@ class SessionRow(tk.Frame):
 
 
 class ClaudeMonitorApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, remote: RemoteSessionSource | None = None,
+                 ssh_host: str | None = None):
         self.root = root
+        self._remote = remote
+        self._open_terminal_fn = lambda cmd: open_terminal(cmd, ssh_host)
         self.rows: dict[str, SessionRow] = {}
 
         root.overrideredirect(True)
@@ -745,7 +807,13 @@ class ClaudeMonitorApp:
     # -- データ更新 -----------------------------------------------------
 
     def refresh(self) -> None:
-        sessions = get_sessions()
+        if self._remote is not None:
+            sessions, error = self._remote.get()
+        else:
+            sessions, error = get_sessions(), None
+        self.empty_label.config(
+            text=error or "アクティブなセッションはありません",
+            fg=COLOR_ERROR if error else COLOR_TEXT_DIM)
         seen_ids = {s.session_id for s in sessions}
 
         # 消えたセッションの行を削除
@@ -753,7 +821,7 @@ class ClaudeMonitorApp:
             if sid not in seen_ids:
                 self.rows.pop(sid).destroy()
 
-        if not sessions:
+        if not sessions or error:
             self.empty_label.pack(fill="x", pady=10)
         else:
             self.empty_label.pack_forget()
@@ -768,14 +836,16 @@ class ClaudeMonitorApp:
             row_bg = COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG
             row = self.rows.get(info.session_id)
             if row is None:
-                row = SessionRow(self.body, row_bg)
+                row = SessionRow(self.body, row_bg, self._open_terminal_fn)
                 self.rows[info.session_id] = row
             row.pack(fill="x")
             row.update_bg(row_bg)
             row.update_data(info)
 
-        row_count = len(sessions) if sessions else 1
-        new_height = 34 + 24 + row_count * SessionRow.ROW_HEIGHT + (0 if sessions else 20)
+        show_label = not sessions or bool(error)
+        new_height = (34 + 24 + len(sessions) * SessionRow.ROW_HEIGHT
+                      + (SessionRow.ROW_HEIGHT if show_label and not sessions else 0)
+                      + (20 if show_label else 0))
         self.root.geometry(f"{self.window_width}x{new_height}")
 
         self.root.after(POLL_INTERVAL_MS, self.refresh)
@@ -786,9 +856,28 @@ class ClaudeMonitorApp:
         self.root.after(BLINK_INTERVAL_MS, self._blink)
 
 
+def _read_token(args: argparse.Namespace) -> str:
+    if args.token_file:
+        return Path(args.token_file).expanduser().read_text(encoding="utf-8").strip()
+    return os.environ.get(TOKEN_ENV_VAR, "").strip()
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Claude Code Monitor (GUI)")
+    parser.add_argument("--server", help="リモートモード: Web版のURL(例 https://claudecode.example.ts.net:8765)。"
+                                         "省略時はこのホストのセッションを直接読む")
+    parser.add_argument("--token-file", help=f"Bearerトークンを書いたファイル(省略時は環境変数{TOKEN_ENV_VAR})")
+    parser.add_argument("--ssh-host", default=DEFAULT_SSH_HOST, help="「端末」ボタンで接続するSSH先")
+    args = parser.parse_args()
+
+    remote = None
+    if args.server:
+        token = _read_token(args)
+        if not token:
+            parser.error(f"--server にはトークンが必要です(--token-file か環境変数{TOKEN_ENV_VAR})")
+        remote = RemoteSessionSource(args.server, token)
     root = tk.Tk()
-    ClaudeMonitorApp(root)
+    ClaudeMonitorApp(root, remote=remote, ssh_host=args.ssh_host if remote else None)
     root.mainloop()
 
 
