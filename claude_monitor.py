@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
+import subprocess
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -192,7 +194,8 @@ def _build_attach_cmd(data: dict) -> str:
     tmux_target = str(data.get("tmux") or "")
     tmux_session = tmux_target.split(":", 1)[0]
     if tmux_session:
-        return f"tmux attach -t {shlex.quote(tmux_session)}"
+        # `=`付きで完全一致指定にする(無いと前方一致で別セッションに入る恐れがある)
+        return f"tmux attach -t {shlex.quote('=' + tmux_session)}"
     return ""
 
 
@@ -511,6 +514,37 @@ def get_sessions() -> list[SessionInfo]:
     return sorted(sessions, key=lambda s: s.last_active, reverse=True)
 
 
+# 接続コマンドを新しい端末ウィンドウで実行する。上から順に、最初に見つかったものを使う。
+# (端末エミュレータ名, コマンドの前に付ける引数)
+_POSIX_TERMINALS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("x-terminal-emulator", ("-e",)),
+    ("gnome-terminal", ("--",)),
+    ("konsole", ("-e",)),
+    ("xfce4-terminal", ("-x",)),
+    ("xterm", ("-e",)),
+)
+
+
+def open_terminal(attach_cmd: str) -> bool:
+    """attach_cmd(`tmux attach -t =名` / `claude attach <id>`)を新しい端末で実行する。
+    起動できる端末が無い・起動に失敗したときは False を返す。"""
+    if not attach_cmd:
+        return False
+    argv = shlex.split(attach_cmd)
+    try:
+        if os.name == "nt":
+            terminal = ["wt.exe"] if shutil.which("wt.exe") else ["cmd.exe", "/c", "start", ""]
+            subprocess.Popen([*terminal, *argv])
+            return True
+        for exe, prefix in _POSIX_TERMINALS:
+            if shutil.which(exe):
+                subprocess.Popen([exe, *prefix, *argv])
+                return True
+    except OSError:
+        return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -523,6 +557,7 @@ class SessionRow(tk.Frame):
     BAR_WIDTH = 220
     BAR_TRACK_WIDTH = 70
     LAMP_SIZE = 16
+    TERM_BUTTON_WIDTH = 34
 
     def __init__(self, master: tk.Widget, bg: str):
         super().__init__(master, bg=bg, height=self.ROW_HEIGHT)
@@ -550,6 +585,19 @@ class SessionRow(tk.Frame):
         )
         self.lamp_canvas.place(x=lamp_x, y=0)
 
+        self._attach_cmd = ""
+        self.term_button = tk.Button(
+            self, text="端末", command=self._on_terminal, bd=0, padx=4, pady=0,
+            bg=COLOR_TRACK, fg=COLOR_TEXT_DIM, activebackground=COLOR_TRACK,
+            activeforeground=COLOR_TEXT, font=("Segoe UI", 8), cursor="hand2",
+        )
+        self._term_button_x = lamp_x + self.LAMP_SIZE + 8 + 6
+
+    def _on_terminal(self) -> None:
+        if not open_terminal(self._attach_cmd):
+            self.term_button.config(text="失敗")
+            self.after(1500, lambda: self.term_button.config(text="端末"))
+
     def update_bg(self, bg: str) -> None:
         """最近アクティブ順の並べ替えで行の位置(縞模様)が変わったときに、
         その行と子ウィジェットの背景色を追従させる。"""
@@ -566,6 +614,12 @@ class SessionRow(tk.Frame):
         self._draw_bar(info)
         self._working = info.working
         self._draw_lamp()
+        self._attach_cmd = info.attach_cmd
+        if info.attach_cmd:
+            self.term_button.place(x=self._term_button_x, y=(self.ROW_HEIGHT - 20) // 2,
+                                   width=self.TERM_BUTTON_WIDTH, height=20)
+        else:
+            self.term_button.place_forget()
 
     def _draw_bar(self, info: SessionInfo) -> None:
         c = self.bar_canvas
@@ -617,7 +671,7 @@ class ClaudeMonitorApp:
         root.attributes("-topmost", True)
         self.window_width = (
             14 + SessionRow.NAME_WIDTH + 10 + SessionRow.BAR_WIDTH + 24
-            + SessionRow.LAMP_SIZE + 8 + 28
+            + SessionRow.LAMP_SIZE + 8 + 6 + SessionRow.TERM_BUTTON_WIDTH + 14
         )
         root.geometry(f"{self.window_width}x60+80+80")
 
