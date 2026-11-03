@@ -30,6 +30,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import ttk
 from tkinter import messagebox
 import urllib.error
 import urllib.request
@@ -88,6 +89,8 @@ STATUS_COL_WIDTH = 60
 BAR_TRACK_WIDTH = 70
 MIN_WINDOW_WIDTH = 420
 MIN_WINDOW_HEIGHT = 200
+SCROLLBAR_WIDTH_PX = 8
+SCROLLBAR_STYLE = "Monitor.Vertical.TScrollbar"
 RESIZE_EDGE_PX = 5      # 右端・下端のドラッグ可能な帯の太さ
 SCREEN_MARGIN_PX = 80   # 自動で高さを合わせるとき、画面の高さから残す余白
 
@@ -932,9 +935,21 @@ class SessionRow(tk.Frame):
         self._draw_lamp()
         self._layout(info, name_col)
 
+    def _ellipsize(self, text: str, max_width: int) -> str:
+        if self._name_font.measure(text) <= max_width:
+            return text
+        while text and self._name_font.measure(text + "…") > max_width:
+            text = text[:-1]
+        return text + "…"
+
     def _layout(self, info: SessionInfo, name_col: int) -> None:
         """名前の右にチップを並べ、列幅に収まらなければ次の行へ折り返す(PWAと同じ挙動)。"""
-        name_w = self._name_font.measure(info.name)
+        # 名前が列幅を超えるとバー(右隣の列)に隠れるため、収まらない分は「…」で省略する
+        shown = self._ellipsize(info.name, max(name_col - ROW_PADDING_X - 4, 40))
+        self.name_label.config(text=shown)
+        name_w = self._name_font.measure(shown)
+        # フォントによって行の高さが違うため、ラベル自身が要求する高さ以上を確保する(切れ防止)
+        name_line = max(NAME_LINE_HEIGHT, self.name_label.winfo_reqheight())
         chips = [self.uuid_chip, self.hide_chip]
         if info.attach_cmd:
             chips.append(self.term_chip)
@@ -943,17 +958,17 @@ class SessionRow(tk.Frame):
         max_x = name_col - 4
         x, y = ROW_PADDING_X + name_w + CHIP_GAP * 2, ROW_NAME_Y
         wrapped = False
-        self.name_label.place(x=ROW_PADDING_X, y=ROW_NAME_Y, width=name_w + 4, height=NAME_LINE_HEIGHT)
+        self.name_label.place(x=ROW_PADDING_X, y=ROW_NAME_Y, width=name_w + 4, height=name_line)
         for chip in chips:
             w = chip.winfo_reqwidth()
             if x + w > max_x and not wrapped:
-                wrapped, x, y = True, ROW_PADDING_X, ROW_NAME_Y + NAME_LINE_HEIGHT + 2
+                wrapped, x, y = True, ROW_PADDING_X, ROW_NAME_Y + name_line + 2
             elif x + w > max_x:
                 x, y = ROW_PADDING_X, y + CHIP_LINE_HEIGHT
             chip.place(x=x, y=y, height=CHIP_LINE_HEIGHT - 2)
             x += w + CHIP_GAP
         last_y = y if wrapped else ROW_NAME_Y
-        cwd_y = last_y + (CHIP_LINE_HEIGHT if wrapped else NAME_LINE_HEIGHT) + 2
+        cwd_y = last_y + (CHIP_LINE_HEIGHT if wrapped else name_line) + 2
         self.cwd_label.place(x=ROW_PADDING_X, y=cwd_y, width=max(name_col - ROW_PADDING_X, 40), height=14)
         self.config(height=cwd_y + 14 + ROW_PADDING_Y)
 
@@ -1286,7 +1301,12 @@ class ClaudeMonitorApp:
         """セッション一覧をスクロール可能なCanvasに載せる(高さが足りないとき用)。"""
         holder = tk.Frame(self.root, bg=COLOR_BG)
         holder.pack(fill="both", expand=True)
-        self._scrollbar = tk.Scrollbar(holder, orient="vertical")
+        # 矢印なしのttkスクロールバーは自身では幅が決まらないため、固定幅の枠に入れる
+        self._scrollbar_box = tk.Frame(holder, width=SCROLLBAR_WIDTH_PX, bg=COLOR_BG)
+        self._scrollbar_box.pack_propagate(False)
+        self._scrollbar = ttk.Scrollbar(self._scrollbar_box, orient="vertical",
+                                        style=self._scrollbar_style())
+        self._scrollbar.pack(fill="both", expand=True)
         self._scroll = tk.Canvas(holder, bg=COLOR_BG, highlightthickness=0, height=1,
                                  yscrollcommand=self._scrollbar.set)
         self._scrollbar.config(command=self._scroll.yview)
@@ -1299,6 +1319,24 @@ class ClaudeMonitorApp:
         self.root.bind_all("<MouseWheel>", self._on_wheel)
         self.root.bind_all("<Button-4>", lambda e: self._scroll.yview_scroll(-3, "units"))
         self.root.bind_all("<Button-5>", lambda e: self._scroll.yview_scroll(3, "units"))
+
+    @staticmethod
+    def _scrollbar_style() -> str:
+        """標準のtk.ScrollbarはWindowsで色を変えられないため、ttk(clam)でアプリの配色に揃える。
+        矢印は省き、細いつまみだけにする。"""
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.layout(SCROLLBAR_STYLE, [("Vertical.Scrollbar.trough", {
+            "sticky": "ns",
+            "children": [("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        style.configure(SCROLLBAR_STYLE, troughcolor=COLOR_BG, background=COLOR_BORDER,
+                        bordercolor=COLOR_BG, lightcolor=COLOR_BORDER, darkcolor=COLOR_BORDER,
+                        relief="flat", borderwidth=0, width=SCROLLBAR_WIDTH_PX,
+                        arrowsize=SCROLLBAR_WIDTH_PX)
+        style.map(SCROLLBAR_STYLE, background=[("active", COLOR_ACCENT), ("pressed", COLOR_ACCENT)],
+                  lightcolor=[("active", COLOR_ACCENT), ("pressed", COLOR_ACCENT)],
+                  darkcolor=[("active", COLOR_ACCENT), ("pressed", COLOR_ACCENT)])
+        return SCROLLBAR_STYLE
 
     def _on_wheel(self, event: tk.Event) -> None:
         step = -1 if event.delta > 0 else 1
@@ -1336,10 +1374,10 @@ class ClaudeMonitorApp:
             self.root.update_idletasks()
             view_h = self._scroll.winfo_height()
         overflow = content_h > view_h > 1
-        if overflow and not self._scrollbar.winfo_ismapped():
-            self._scrollbar.pack(side="right", fill="y")
-        elif not overflow and self._scrollbar.winfo_ismapped():
-            self._scrollbar.pack_forget()
+        if overflow and not self._scrollbar_box.winfo_ismapped():
+            self._scrollbar_box.pack(side="right", fill="y")
+        elif not overflow and self._scrollbar_box.winfo_ismapped():
+            self._scrollbar_box.pack_forget()
             self._scroll.yview_moveto(0)
 
     def _build_resize_handles(self) -> None:
