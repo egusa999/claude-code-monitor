@@ -156,6 +156,18 @@ INDEX_HTML = """<!doctype html>
     border-radius: 4px;
     cursor: pointer;
   }
+  .term-btn {
+    font-weight: 400;
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-left: 4px;
+    padding: 1px 6px;
+    background: var(--track);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .term-btn:hover { color: var(--text); border-color: var(--accent); }
   .hidden-tray {
     border-top: 1px solid var(--border);
     padding: 10px 14px;
@@ -476,7 +488,7 @@ function renderRows(limit, sessions) {
     const uuidLabel = revealedUuids.has(s.session_id) ? id : 'UUID';
     return `
       <div class="row">
-        <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button><span class="cwd">${escapeHtml(s.cwd)}</span></div>
+        <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button>${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}<span class="cwd">${escapeHtml(s.cwd)}</span></div>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${s.context_pct}%"></div></div>
           <div class="pct-wrap">
@@ -494,7 +506,35 @@ function renderRows(limit, sessions) {
 let lastLimit = 0;
 let lastSessions = [];
 
+// 接続コマンド(`claude attach <id>` / `tmux attach -t <名>`)をクリップボードへコピーする。
+// ブラウザからサーバー上の端末は直接開けないため、端末側で貼り付けて実行してもらう。
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+}
+
 rowsEl.addEventListener('click', (e) => {
+  const termBtn = e.target.closest('.term-btn');
+  if (termBtn) {
+    const cmd = termBtn.dataset.cmd;
+    copyText(cmd).then(ok => {
+      const prev = termBtn.textContent;
+      termBtn.textContent = ok ? 'コピー済' : 'コピー失敗';
+      setTimeout(() => { termBtn.textContent = prev; }, 1500);
+    });
+    return;
+  }
   const uuidBtn = e.target.closest('.uuid-btn');
   if (uuidBtn) {
     const id = uuidBtn.dataset.id;

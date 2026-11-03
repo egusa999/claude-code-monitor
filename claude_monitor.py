@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -107,6 +108,7 @@ class SessionInfo:
     working: bool = False
     last_active: float = 0.0
     agents: list[AgentInfo] = field(default_factory=list)
+    attach_cmd: str = ""  # 端末で実行する接続コマンド(コピー用)。接続手段が無ければ空
 
 
 # セッションごとに直近判明したコンテキストトークン数を保持するキャッシュ。
@@ -181,6 +183,19 @@ def _is_same_process_instance(pid: int, recorded_start_ticks: int | None) -> boo
     return actual_start_ticks == recorded_start_ticks
 
 
+def _build_attach_cmd(data: dict) -> str:
+    """セッションに端末から接続するコマンドを作る。bgは`claude attach <jobId>`
+    (`claude agents`のセッションマネージャーと同じ手段)、tmux上の対話セッションは
+    `tmux attach -t <セッション名>`。値はJSON由来なのでshlex.quoteで必ず無害化する。"""
+    if data.get("kind") == "bg" and data.get("jobId"):
+        return f"claude attach {shlex.quote(str(data['jobId']))}"
+    tmux_target = str(data.get("tmux") or "")
+    tmux_session = tmux_target.split(":", 1)[0]
+    if tmux_session:
+        return f"tmux attach -t {shlex.quote(tmux_session)}"
+    return ""
+
+
 def _load_active_sessions() -> list[SessionInfo]:
     """~/.claude/sessions/*.json から、プロセスが生存中のセッションのみ返す。"""
     sessions: dict[str, SessionInfo] = {}
@@ -224,6 +239,7 @@ def _load_active_sessions() -> list[SessionInfo]:
             name=name,
             cwd=cwd,
             started_at=started_at,
+            attach_cmd=_build_attach_cmd(data),
         )
         # 同一 sessionId の重複(古い meta ファイル残存等)は新しい方を優先
         existing = sessions.get(session_id)
