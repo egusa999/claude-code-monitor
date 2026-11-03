@@ -65,6 +65,9 @@ DEFAULT_SSH_HOST = "root@claudecode"  # リモートモードで端末を開く�
 REMOTE_FETCH_TIMEOUT_SEC = 5          # サーバーAPIの応答待ち上限
 TOKEN_ENV_VAR = "CLAUDE_MONITOR_TOKEN"
 COLOR_ERROR = "#ff4d4d"
+CONFIG_PATH = Path.home() / ".claude_monitor" / "config.json"  # リモートモードの接続設定(server/token/ssh_host)
+# ssh先は先頭が英数字のみ許可(`-o...`のようなオプション注入を防ぐ)
+SSH_HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 LOG_PATH = Path.home() / ".claude_monitor" / "app.log"  # pyw起動だとコンソールが無いため、エラーはここに残す
 # リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
 ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
@@ -546,7 +549,7 @@ def open_terminal(attach_cmd: str, ssh_host: str | None = None) -> bool:
     if not attach_cmd:
         return False
     if ssh_host:
-        if not ATTACH_CMD_PATTERN.match(attach_cmd):
+        if not ATTACH_CMD_PATTERN.match(attach_cmd) or not SSH_HOST_PATTERN.match(ssh_host):
             return False
         argv = ["ssh", "-t", ssh_host, attach_cmd]
     else:
@@ -569,17 +572,27 @@ class RemoteSessionSource:
     """サーバーのWeb版(`/api/sessions`)からセッション一覧を取得する。
     ネットワーク待ちでGUIを固めないよう、取得は別スレッドで周期実行し、get()は最新結果を返す。"""
 
-    def __init__(self, base_url: str, token: str):
-        self._url = base_url.rstrip("/") + "/api/sessions"
-        self._token = token
+    def __init__(self, base_url: str = "", token: str = ""):
         self._lock = threading.Lock()
+        self._url = ""
+        self._token = ""
         self._sessions: list[SessionInfo] = []
-        self._error: str | None = "接続中..."
+        self._error: str | None = "設定してください(右上の ⚙)"
+        self.configure(base_url, token)
         threading.Thread(target=self._loop, daemon=True).start()
 
+    def configure(self, base_url: str, token: str) -> None:
+        """接続先・トークンを(再)設定する。空なら未設定として取得しない。"""
+        with self._lock:
+            self._url = base_url.rstrip("/") + "/api/sessions" if base_url else ""
+            self._token = token
+            self._sessions = []
+            self._error = "接続中..." if (base_url and token) else "設定してください(右上の ⚙)"
+
     def _fetch(self) -> list[SessionInfo]:
-        req = urllib.request.Request(
-            self._url, headers={"Authorization": f"Bearer {self._token}"})
+        with self._lock:
+            url, token = self._url, self._token
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=REMOTE_FETCH_TIMEOUT_SEC) as res:
             payload = json.load(res)
         names = {f.name for f in fields(SessionInfo)} - {"agents"}
@@ -588,6 +601,11 @@ class RemoteSessionSource:
 
     def _loop(self) -> None:
         while True:
+            with self._lock:
+                configured = bool(self._url and self._token)
+            if not configured:
+                time.sleep(POLL_INTERVAL_MS / 1000.0)
+                continue
             try:
                 sessions, error = self._fetch(), None
             except urllib.error.HTTPError as e:
@@ -604,6 +622,99 @@ class RemoteSessionSource:
         """(直近に取得できた一覧, 接続エラー文言またはNone)。"""
         with self._lock:
             return list(self._sessions), self._error
+
+
+def normalize_server_url(raw: str) -> str:
+    """入力されたサーバーURLを整える。スキーム省略時はhttps(実運用はTLS)。不正ならValueError。"""
+    url = raw.strip().rstrip("/")
+    if not url:
+        raise ValueError("サーバーURLを入力してください")
+    if "://" not in url:
+        url = "https://" + url
+    if not re.match(r"^https?://[^\s/]+$", url):
+        raise ValueError("サーバーURLは https://ホスト名:ポート の形式で入力してください")
+    return url
+
+
+def load_config() -> dict[str, str]:
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: str(data.get(k, "")) for k in ("server", "token", "ssh_host")}
+
+
+def save_config(cfg: dict[str, str]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(CONFIG_PATH, 0o600)  # トークン入りなので本人のみ読めるようにする(Windowsでは実質無効)
+    except OSError:
+        pass
+
+
+class SettingsDialog(tk.Toplevel):
+    """サーバーURL・トークン・SSH先を入力・保存するダイアログ。保存されたら self.result に辞書が入る。"""
+
+    def __init__(self, master: tk.Tk, current: dict[str, str]):
+        super().__init__(master, bg=COLOR_BG)
+        self.title("接続設定")
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.result: dict[str, str] | None = None
+
+        self._server = tk.StringVar(value=current.get("server", ""))
+        self._token = tk.StringVar(value=current.get("token", ""))
+        self._ssh = tk.StringVar(value=current.get("ssh_host") or DEFAULT_SSH_HOST)
+        self._error = tk.StringVar()
+
+        rows = (("サーバーURL", self._server, False), ("トークン", self._token, True),
+                ("SSH接続先(端末ボタン用)", self._ssh, False))
+        for r, (label, var, secret) in enumerate(rows):
+            tk.Label(self, text=label, bg=COLOR_BG, fg=COLOR_TEXT, anchor="w",
+                     font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w", padx=12, pady=(10, 0))
+            entry = tk.Entry(self, textvariable=var, width=46, show="*" if secret else "",
+                             bg=COLOR_ROW_BG, fg=COLOR_TEXT, insertbackground=COLOR_TEXT,
+                             relief="flat", font=("Consolas", 10))
+            entry.grid(row=r, column=1, padx=12, pady=(10, 0), ipady=3)
+            if secret:
+                self._token_entry = entry
+        self._show = tk.BooleanVar(value=False)
+        tk.Checkbutton(self, text="トークンを表示", variable=self._show, command=self._toggle_show,
+                       bg=COLOR_BG, fg=COLOR_TEXT_DIM, selectcolor=COLOR_ROW_BG,
+                       activebackground=COLOR_BG, activeforeground=COLOR_TEXT,
+                       font=("Segoe UI", 8)).grid(row=3, column=1, sticky="w", padx=12)
+        tk.Label(self, textvariable=self._error, bg=COLOR_BG, fg=COLOR_ERROR, anchor="w",
+                 font=("Segoe UI", 9)).grid(row=4, column=0, columnspan=2, sticky="w", padx=12)
+        buttons = tk.Frame(self, bg=COLOR_BG)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        tk.Button(buttons, text="保存", command=self._save, width=8).pack(side="right", padx=(6, 0))
+        tk.Button(buttons, text="キャンセル", command=self.destroy, width=10).pack(side="right")
+
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        self.focus_force()
+
+    def _toggle_show(self) -> None:
+        self._token_entry.config(show="" if self._show.get() else "*")
+
+    def _save(self) -> None:
+        try:
+            server = normalize_server_url(self._server.get())
+        except ValueError as e:
+            self._error.set(str(e))
+            return
+        token = self._token.get().strip()
+        ssh_host = self._ssh.get().strip() or DEFAULT_SSH_HOST
+        if not token:
+            self._error.set("トークンを入力してください")
+            return
+        if not SSH_HOST_PATTERN.match(ssh_host):
+            self._error.set("SSH接続先は root@claudecode のような形式で入力してください")
+            return
+        self.result = {"server": server, "token": token, "ssh_host": ssh_host}
+        self.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +839,8 @@ class ClaudeMonitorApp:
                  ssh_host: str | None = None):
         self.root = root
         self._remote = remote
-        self._open_terminal_fn = lambda cmd: open_terminal(cmd, ssh_host)
+        self._ssh_host = ssh_host
+        self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
         self.rows: dict[str, SessionRow] = {}
 
         root.overrideredirect(True)
@@ -774,6 +886,14 @@ class ClaudeMonitorApp:
         close_btn.bind("<Enter>", lambda e: close_btn.config(fg=COLOR_RED_ON))
         close_btn.bind("<Leave>", lambda e: close_btn.config(fg=COLOR_TEXT_DIM))
 
+        if self._remote is not None:
+            settings_btn = tk.Label(
+                bar, text="⚙", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
+                font=("Segoe UI", 10), cursor="hand2",
+            )
+            settings_btn.pack(side="right", padx=4)
+            settings_btn.bind("<Button-1>", lambda e: self.open_settings())
+
         refresh_btn = tk.Label(
             bar, text="↻", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
             font=("Segoe UI", 10), cursor="hand2",
@@ -785,6 +905,24 @@ class ClaudeMonitorApp:
         for widget in (bar,):
             widget.bind("<ButtonPress-1>", self._start_move)
             widget.bind("<B1-Motion>", self._on_move)
+
+    def open_settings(self) -> None:
+        """接続設定ダイアログを開き、保存されたら即座に接続し直す。"""
+        if self._remote is None:
+            return
+        dialog = SettingsDialog(self.root, load_config())
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return
+        try:
+            save_config(dialog.result)
+        except OSError as e:
+            logging.error("config save failed: %s", e)
+            messagebox.showerror("Claude Code Monitor", f"設定を保存できませんでした: {CONFIG_PATH}\n({e})")
+        logging.info("settings updated: server=%s ssh_host=%s",
+                     dialog.result["server"], dialog.result["ssh_host"])
+        self._ssh_host = dialog.result["ssh_host"]
+        self._remote.configure(dialog.result["server"], dialog.result["token"])
 
     def _build_header(self) -> None:
         header = tk.Frame(self.root, bg=COLOR_BG, height=24)
@@ -905,21 +1043,29 @@ def _show_fatal(message: str) -> None:
 
 def _run() -> None:
     parser = argparse.ArgumentParser(description="Claude Code Monitor (GUI)")
-    parser.add_argument("--server", help="リモートモード: Web版のURL(例 https://claudecode.example.ts.net:8765)。"
-                                         "省略時はこのホストのセッションを直接読む")
-    parser.add_argument("--token-file", help=f"Bearerトークンを書いたファイル(省略時は環境変数{TOKEN_ENV_VAR})")
-    parser.add_argument("--ssh-host", default=DEFAULT_SSH_HOST, help="「端末」ボタンで接続するSSH先")
+    parser.add_argument("--remote", action="store_true",
+                        help="リモートモード。接続設定はGUIの ⚙ で入力・保存する(config.json)")
+    parser.add_argument("--server", help="リモートモード: Web版のURL(保存済み設定より優先)")
+    parser.add_argument("--token-file", help=f"Bearerトークンのファイル(保存済み設定より優先。環境変数{TOKEN_ENV_VAR}も可)")
+    parser.add_argument("--ssh-host", help=f"「端末」ボタンで接続するSSH先(既定 {DEFAULT_SSH_HOST})")
     args = parser.parse_args()
 
     remote = None
-    if args.server:
-        token = _read_token(args)
-        if not token:
-            raise StartupError(f"--server にはトークンが必要です(--token-file か環境変数{TOKEN_ENV_VAR})")
-        logging.info("remote mode: server=%s ssh_host=%s", args.server, args.ssh_host)
-        remote = RemoteSessionSource(args.server, token)
+    ssh_host = None
+    if args.remote or args.server:
+        cfg = load_config()
+        try:
+            server = normalize_server_url(args.server) if args.server else cfg.get("server", "")
+        except ValueError as e:
+            raise StartupError(str(e)) from e
+        token = _read_token(args) or cfg.get("token", "")
+        ssh_host = args.ssh_host or cfg.get("ssh_host") or DEFAULT_SSH_HOST
+        remote = RemoteSessionSource(server, token)
+        logging.info("remote mode: server=%s ssh_host=%s", server or "(unset)", ssh_host)
     root = tk.Tk()
-    ClaudeMonitorApp(root, remote=remote, ssh_host=args.ssh_host if remote else None)
+    app = ClaudeMonitorApp(root, remote=remote, ssh_host=ssh_host)
+    if remote is not None and not (server and token):
+        root.after(200, app.open_settings)  # 未設定なら、起動直後に設定ダイアログを出す
     root.mainloop()
 
 
