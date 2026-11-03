@@ -71,6 +71,8 @@ SSH_HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 LOG_PATH = Path.home() / ".claude_monitor" / "app.log"  # pyw起動だとコンソールが無いため、エラーはここに残す
 # リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
 ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
+KICKOFF_PANEL_HEIGHT = 44
+KICKOFF_STATUS_LABELS = {"success": "成功", "error": "エラー", "skipped": "スキップ"}
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
 SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
@@ -574,8 +576,9 @@ class RemoteSessionSource:
 
     def __init__(self, base_url: str = "", token: str = ""):
         self._lock = threading.Lock()
-        self._url = ""
+        self._base = ""
         self._token = ""
+        self._kickoff: dict | None = None
         self._sessions: list[SessionInfo] = []
         self._error: str | None = "設定してください(右上の ⚙)"
         self.configure(base_url, token)
@@ -584,17 +587,27 @@ class RemoteSessionSource:
     def configure(self, base_url: str, token: str) -> None:
         """接続先・トークンを(再)設定する。空なら未設定として取得しない。"""
         with self._lock:
-            self._url = base_url.rstrip("/") + "/api/sessions" if base_url else ""
+            self._base = base_url.rstrip("/")
             self._token = token
             self._sessions = []
+            self._kickoff = None
             self._error = "接続中..." if (base_url and token) else "設定してください(右上の ⚙)"
 
-    def _fetch(self) -> list[SessionInfo]:
+    def _request(self, path: str, body: dict | None = None) -> dict:
+        """サーバーAPIを呼ぶ(bodyがあればPOST)。失敗時はurllib/OSError/ValueErrorを送出する。"""
         with self._lock:
-            url, token = self._url, self._token
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            base, token = self._base, self._token
+        headers = {"Authorization": f"Bearer {token}"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(base + path, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=REMOTE_FETCH_TIMEOUT_SEC) as res:
-            payload = json.load(res)
+            return json.load(res)
+
+    def _fetch(self) -> list[SessionInfo]:
+        payload = self._request("/api/sessions")
         names = {f.name for f in fields(SessionInfo)} - {"agents"}
         return [SessionInfo(**{k: v for k, v in item.items() if k in names})
                 for item in payload["sessions"]]
@@ -602,7 +615,7 @@ class RemoteSessionSource:
     def _loop(self) -> None:
         while True:
             with self._lock:
-                configured = bool(self._url and self._token)
+                configured = bool(self._base and self._token)
             if not configured:
                 time.sleep(POLL_INTERVAL_MS / 1000.0)
                 continue
@@ -612,16 +625,49 @@ class RemoteSessionSource:
                 sessions, error = None, "トークンが無効です" if e.code == 401 else f"HTTP {e.code}"
             except (OSError, ValueError, KeyError, TypeError):
                 sessions, error = None, "サーバーに接続できません"
+            kickoff = None
+            if error is None:
+                try:
+                    kickoff = self._request("/api/kickoff")
+                except (OSError, ValueError):
+                    kickoff = None  # Hello状態が取れなくても一覧表示は止めない(前回値を保持)
             with self._lock:
                 if sessions is not None:
                     self._sessions = sessions
+                if kickoff is not None:
+                    self._kickoff = kickoff
                 self._error = error
             time.sleep(POLL_INTERVAL_MS / 1000.0)
+
+    def get_kickoff(self) -> dict | None:
+        """毎朝4時Hello送信の最新状態(未取得ならNone)。"""
+        with self._lock:
+            return dict(self._kickoff) if self._kickoff else None
+
+    def set_kickoff(self, enabled: bool) -> bool:
+        """Hello送信の有効/無効を切り替える(呼び出し元のスレッドでブロックする)。成否を返す。"""
+        try:
+            state = self._request("/api/kickoff/toggle", {"enabled": enabled})
+        except (OSError, ValueError):
+            return False
+        with self._lock:
+            self._kickoff = state
+        return True
 
     def get(self) -> tuple[list[SessionInfo], str | None]:
         """(直近に取得できた一覧, 接続エラー文言またはNone)。"""
         with self._lock:
             return list(self._sessions), self._error
+
+
+def format_kickoff_time(iso: str | None) -> str:
+    """Hello送信の前回実行時刻(ISO8601)をローカル時刻の短い表記にする。"""
+    if not iso:
+        return "(まだ実行なし)"
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%m/%d %H:%M")
+    except ValueError:
+        return iso
 
 
 def normalize_server_url(raw: str) -> str:
@@ -853,6 +899,11 @@ class ClaudeMonitorApp:
         root.geometry(f"{self.window_width}x60+80+80")
 
         self._build_titlebar()
+        self._kickoff_height = 0
+        self._kickoff_syncing = False
+        self._kickoff_result: tuple[bool, bool] | None = None
+        if self._remote is not None:
+            self._build_kickoff_panel()
         self._build_header()
         self.body = tk.Frame(root, bg=COLOR_BG)
         self.body.pack(fill="both", expand=True)
@@ -906,6 +957,57 @@ class ClaudeMonitorApp:
             widget.bind("<ButtonPress-1>", self._start_move)
             widget.bind("<B1-Motion>", self._on_move)
 
+    def _build_kickoff_panel(self) -> None:
+        """毎朝4時(JST)のHello送信の状態表示と有効/無効の切り替え(Web版・PWAと同じ内容)。"""
+        self._kickoff_height = KICKOFF_PANEL_HEIGHT
+        panel = tk.Frame(self.root, bg=COLOR_ROW_BG, height=KICKOFF_PANEL_HEIGHT)
+        panel.pack(fill="x", side="top")
+        panel.pack_propagate(False)
+        self._kickoff_var = tk.BooleanVar(value=False)
+        self._kickoff_check = tk.Checkbutton(
+            panel, variable=self._kickoff_var, command=self._on_kickoff_toggle,
+            bg=COLOR_ROW_BG, activebackground=COLOR_ROW_BG, selectcolor=COLOR_TRACK,
+            state="disabled", bd=0)
+        self._kickoff_check.pack(side="right", padx=10)
+        self._kickoff_label = tk.Label(
+            panel, text="毎朝4時(JST) Hello送信: 読み込み中...", bg=COLOR_ROW_BG, fg=COLOR_TEXT_DIM,
+            font=("Segoe UI", 8), justify="left", anchor="w")
+        self._kickoff_label.pack(side="left", padx=12, fill="x", expand=True)
+
+    def _on_kickoff_toggle(self) -> None:
+        enabled = self._kickoff_var.get()
+        self._kickoff_syncing = True
+        self._kickoff_check.config(state="disabled")
+
+        def work() -> None:
+            # tkのウィジェットはメインスレッド以外から触らない。結果だけ置き、次のrefreshで反映する
+            self._kickoff_result = (self._remote.set_kickoff(enabled), enabled)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_kickoff_panel(self) -> None:
+        if self._remote is None:
+            return
+        if self._kickoff_syncing:
+            if self._kickoff_result is None:
+                return  # 切り替え通信の完了待ち
+            ok, enabled = self._kickoff_result
+            self._kickoff_result = None
+            self._kickoff_syncing = False
+            if not ok:
+                self._kickoff_var.set(not enabled)  # 失敗したので表示を元に戻す
+        state = self._remote.get_kickoff()
+        if state is None:
+            return
+        self._kickoff_var.set(bool(state.get("enabled")))
+        self._kickoff_check.config(state="normal")
+        status = state.get("last_status")
+        last = format_kickoff_time(state.get("last_run"))
+        self._kickoff_label.config(
+            text=(f"毎朝4時(JST) Hello送信: {'有効' if state.get('enabled') else '無効'}\n"
+                  f"次回 {state.get('next_run_local') or '-'} / 前回 {last} "
+                  f"{KICKOFF_STATUS_LABELS.get(status, status or '-')}"),
+            fg=COLOR_ERROR if status == "error" else COLOR_TEXT_DIM)
+
     def open_settings(self) -> None:
         """接続設定ダイアログを開き、保存されたら即座に接続し直す。"""
         if self._remote is None:
@@ -955,6 +1057,7 @@ class ClaudeMonitorApp:
         self.empty_label.config(
             text=error or "アクティブなセッションはありません",
             fg=COLOR_ERROR if error else COLOR_TEXT_DIM)
+        self._update_kickoff_panel()
         seen_ids = {s.session_id for s in sessions}
 
         # 消えたセッションの行を削除
@@ -984,7 +1087,7 @@ class ClaudeMonitorApp:
             row.update_data(info)
 
         show_label = not sessions or bool(error)
-        new_height = (34 + 24 + len(sessions) * SessionRow.ROW_HEIGHT
+        new_height = (34 + self._kickoff_height + 24 + len(sessions) * SessionRow.ROW_HEIGHT
                       + (SessionRow.ROW_HEIGHT if show_label and not sessions else 0)
                       + (20 if show_label else 0))
         self.root.geometry(f"{self.window_width}x{new_height}")
