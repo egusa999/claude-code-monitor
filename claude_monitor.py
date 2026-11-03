@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import shlex
@@ -28,6 +29,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, fields
@@ -63,6 +65,7 @@ DEFAULT_SSH_HOST = "root@claudecode"  # リモートモードで端末を開く�
 REMOTE_FETCH_TIMEOUT_SEC = 5          # サーバーAPIの応答待ち上限
 TOKEN_ENV_VAR = "CLAUDE_MONITOR_TOKEN"
 COLOR_ERROR = "#ff4d4d"
+LOG_PATH = Path.home() / ".claude_monitor" / "app.log"  # pyw起動だとコンソールが無いため、エラーはここに残す
 # リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
 ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
@@ -856,13 +859,51 @@ class ClaudeMonitorApp:
         self.root.after(BLINK_INTERVAL_MS, self._blink)
 
 
+class StartupError(Exception):
+    """起動条件の不備(トークン未設定など)。メッセージはそのままユーザーに見せる。"""
+
+
+def _setup_logging() -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        filename=LOG_PATH, level=logging.INFO, encoding="utf-8",
+        format="%(asctime)s %(levelname)s %(message)s")
+
+
 def _read_token(args: argparse.Namespace) -> str:
     if args.token_file:
-        return Path(args.token_file).expanduser().read_text(encoding="utf-8").strip()
+        path = Path(args.token_file).expanduser()
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise StartupError(f"トークンファイルを読めません: {path}\n({e})") from e
     return os.environ.get(TOKEN_ENV_VAR, "").strip()
 
 
 def main() -> None:
+    _setup_logging()
+    try:
+        _run()
+    except StartupError as e:
+        logging.error("startup error: %s", e)
+        _show_fatal(str(e))
+    except Exception:
+        logging.exception("fatal error")
+        _show_fatal(f"予期しないエラーで終了しました。詳細: {LOG_PATH}")
+
+
+def _show_fatal(message: str) -> None:
+    """コンソールの無いpyw起動でも気づけるよう、ダイアログで知らせる。"""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Claude Code Monitor", message)
+        root.destroy()
+    except tk.TclError:
+        pass  # GUIが出せない環境ではログのみ
+
+
+def _run() -> None:
     parser = argparse.ArgumentParser(description="Claude Code Monitor (GUI)")
     parser.add_argument("--server", help="リモートモード: Web版のURL(例 https://claudecode.example.ts.net:8765)。"
                                          "省略時はこのホストのセッションを直接読む")
@@ -874,7 +915,8 @@ def main() -> None:
     if args.server:
         token = _read_token(args)
         if not token:
-            parser.error(f"--server にはトークンが必要です(--token-file か環境変数{TOKEN_ENV_VAR})")
+            raise StartupError(f"--server にはトークンが必要です(--token-file か環境変数{TOKEN_ENV_VAR})")
+        logging.info("remote mode: server=%s ssh_host=%s", args.server, args.ssh_host)
         remote = RemoteSessionSource(args.server, token)
     root = tk.Tk()
     ClaudeMonitorApp(root, remote=remote, ssh_host=args.ssh_host if remote else None)
