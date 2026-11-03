@@ -86,7 +86,15 @@ HEADER_HEIGHT = 28
 BAR_COL_WIDTH = 190
 STATUS_COL_WIDTH = 60
 BAR_TRACK_WIDTH = 70
-NAME_COL_WIDTH = WINDOW_WIDTH - ROW_PADDING_X * 2 - BAR_COL_WIDTH - STATUS_COL_WIDTH
+MIN_WINDOW_WIDTH = 420
+MIN_WINDOW_HEIGHT = 200
+RESIZE_EDGE_PX = 5      # 右端・下端のドラッグ可能な帯の太さ
+SCREEN_MARGIN_PX = 80   # 自動で高さを合わせるとき、画面の高さから残す余白
+
+
+def name_col_width(window_width: int) -> int:
+    """名前列の幅(残りをバー列とステータス列が占める)。"""
+    return window_width - ROW_PADDING_X * 2 - BAR_COL_WIDTH - STATUS_COL_WIDTH
 UI_PREFS_PATH = Path.home() / ".claude_monitor" / "ui.json"  # 画面設定(最前面ピン)
 HIDDEN_PATH = Path.home() / ".claude_monitor" / "hidden.json"  # 「非表示」にしたセッションID
 KICKOFF_STATUS_LABELS = {"success": "成功", "error": "エラー", "skipped": "スキップ"}
@@ -94,6 +102,9 @@ POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
 SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
 AGENT_FILE_GLOB = "agent-*.jsonl"
+RELAYOUT_DELAY_MS = 80              # リサイズ中の再配置の間引き間隔
+CORNER_CURSOR = "size_nw_se" if os.name == "nt" else "bottom_right_corner"  # Tkのカーソル名はOSで異なる
+RESIZE_GRIP_PX = 14                 # 右下のリサイズ角の大きさ
 BLINK_INTERVAL_MS = 500             # 赤ランプの点滅間隔
 TRANSCRIPT_TAIL_BYTES = 65536        # トランスクリプト末尾読み取りの初期サイズ
 TRANSCRIPT_MAX_SCAN_BYTES = 8 * 1024 * 1024  # 見つからない場合に拡大する上限(8MB)
@@ -677,18 +688,19 @@ class RemoteSessionSource:
             return list(self._sessions), self._error
 
 
-def load_topmost() -> bool:
-    """最前面に固定するか。既定はオフ(他のウィンドウの邪魔をしない)。"""
+def load_ui_prefs() -> dict:
+    """画面設定(topmost / width / height)。無い・壊れているときは空。"""
     try:
-        return bool(json.loads(UI_PREFS_PATH.read_text(encoding="utf-8")).get("topmost"))
-    except (OSError, ValueError, AttributeError):
-        return False
+        data = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def save_topmost(value: bool) -> None:
+def save_ui_prefs(prefs: dict) -> None:
     try:
         UI_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        UI_PREFS_PATH.write_text(json.dumps({"topmost": value}), encoding="utf-8")
+        UI_PREFS_PATH.write_text(json.dumps(prefs), encoding="utf-8")
     except OSError as e:
         logging.error("ui prefs save failed: %s", e)
 
@@ -901,10 +913,10 @@ class SessionRow(tk.Frame):
         self.term_chip = Chip(self, "端末", self._on_terminal, bg)
 
         self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=36, bg=bg, highlightthickness=0)
-        self.bar_canvas.place(x=NAME_COL_WIDTH + ROW_PADDING_X, rely=0.5, anchor="w")
+        self.bar_canvas.place(relx=1.0, x=-(ROW_PADDING_X + STATUS_COL_WIDTH), rely=0.5, anchor="e")
         self.lamp_canvas = tk.Canvas(self, width=self.LAMP_SIZE + 8, height=self.LAMP_SIZE + 8,
                                      bg=bg, highlightthickness=0)
-        self.lamp_canvas.place(x=WINDOW_WIDTH - ROW_PADDING_X, rely=0.5, anchor="e")
+        self.lamp_canvas.place(relx=1.0, x=-ROW_PADDING_X, rely=0.5, anchor="e")
 
     def _on_terminal(self) -> None:
         if not self._open_terminal_fn(self._attach_cmd):
@@ -920,7 +932,7 @@ class SessionRow(tk.Frame):
                   self.term_chip, self.bar_canvas, self.lamp_canvas):
             w.config(bg=bg)
 
-    def update_data(self, info: SessionInfo, revealed: bool) -> None:
+    def update_data(self, info: SessionInfo, revealed: bool, name_col: int) -> None:
         self._session_id = info.session_id
         self._attach_cmd = info.attach_cmd
         self._working = info.working
@@ -929,9 +941,9 @@ class SessionRow(tk.Frame):
         self.uuid_chip.config(text=info.session_id if revealed else "UUID")
         self._draw_bar(info)
         self._draw_lamp()
-        self._layout(info)
+        self._layout(info, name_col)
 
-    def _layout(self, info: SessionInfo) -> None:
+    def _layout(self, info: SessionInfo, name_col: int) -> None:
         """名前の右にチップを並べ、列幅に収まらなければ次の行へ折り返す(PWAと同じ挙動)。"""
         name_w = self._name_font.measure(info.name)
         chips = [self.uuid_chip, self.hide_chip]
@@ -939,7 +951,7 @@ class SessionRow(tk.Frame):
             chips.append(self.term_chip)
         else:
             self.term_chip.place_forget()
-        max_x = NAME_COL_WIDTH - 4
+        max_x = name_col - 4
         x, y = ROW_PADDING_X + name_w + CHIP_GAP * 2, ROW_NAME_Y
         wrapped = False
         self.name_label.place(x=ROW_PADDING_X, y=ROW_NAME_Y, width=name_w + 4, height=NAME_LINE_HEIGHT)
@@ -953,7 +965,7 @@ class SessionRow(tk.Frame):
             x += w + CHIP_GAP
         last_y = y if wrapped else ROW_NAME_Y
         cwd_y = last_y + (CHIP_LINE_HEIGHT if wrapped else NAME_LINE_HEIGHT) + 2
-        self.cwd_label.place(x=ROW_PADDING_X, y=cwd_y, width=NAME_COL_WIDTH - ROW_PADDING_X, height=14)
+        self.cwd_label.place(x=ROW_PADDING_X, y=cwd_y, width=max(name_col - ROW_PADDING_X, 40), height=14)
         self.config(height=cwd_y + 14 + ROW_PADDING_Y)
 
     def _draw_bar(self, info: SessionInfo) -> None:
@@ -1006,9 +1018,17 @@ class ClaudeMonitorApp:
 
         root.overrideredirect(True)
         root.configure(bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        self._topmost = load_topmost()
+        self._prefs = load_ui_prefs()
+        self._topmost = bool(self._prefs.get("topmost"))
         root.attributes("-topmost", self._topmost)
-        root.geometry(f"{WINDOW_WIDTH}x60+80+80")
+        self._width = max(int(self._prefs.get("width") or WINDOW_WIDTH), MIN_WINDOW_WIDTH)
+        saved_height = int(self._prefs.get("height") or 0)
+        # 一度でも手動でリサイズした(高さが保存されている)ら、以後は高さを自動調整しない
+        self._user_sized = saved_height >= MIN_WINDOW_HEIGHT
+        self._height = saved_height if self._user_sized else 60
+        root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        root.geometry(f"{self._width}x{self._height}+80+80")
+        self._relayout_job: str | None = None
 
         self._build_titlebar()
         self._kickoff_syncing = False
@@ -1016,15 +1036,17 @@ class ClaudeMonitorApp:
         if self._remote is not None:
             self._build_kickoff_panel()
         self._build_header()
-        self.body = tk.Frame(root, bg=COLOR_BG)
-        self.body.pack(fill="x")
+        # 非表示トレイは下端に固定し、残りをスクロール可能な一覧領域にする
+        self.tray = tk.Frame(root, bg=COLOR_BG, highlightthickness=0)
+        self.tray.pack(side="bottom", fill="x")
+        self._build_scroll_area()
 
         self.empty_label = tk.Label(
             self.body, text="アクティブなセッションはありません",
             bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9),
         )
-        self.tray = tk.Frame(root, bg=COLOR_BG, highlightthickness=0)
         self.tray_inner = tk.Frame(self.tray, bg=COLOR_BG)
+        self._build_resize_handles()
 
         self.refresh()
         self._blink()
@@ -1085,7 +1107,8 @@ class ClaudeMonitorApp:
         self._topmost = not self._topmost
         self.root.attributes("-topmost", self._topmost)
         self._pin_btn.config(fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM)
-        save_topmost(self._topmost)
+        self._prefs["topmost"] = self._topmost
+        save_ui_prefs(self._prefs)
 
     def _build_kickoff_panel(self) -> None:
         """毎朝4時(JST)のHello送信のカード(PWAと同じ: タイトル+状態3行+スイッチ)。"""
@@ -1168,15 +1191,16 @@ class ClaudeMonitorApp:
 
     def _build_header(self) -> None:
         header = tk.Frame(self.root, bg=COLOR_BG, height=HEADER_HEIGHT)
+        self._header = header
         header.pack(fill="x")
         header.pack_propagate(False)
         font = ("Segoe UI", 8)
         tk.Label(header, text="SESSION", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
             x=ROW_PADDING_X, y=8)
         tk.Label(header, text="CONTEXT USED", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
-            x=NAME_COL_WIDTH + ROW_PADDING_X, y=8)
+            relx=1.0, x=-(ROW_PADDING_X + STATUS_COL_WIDTH + BAR_COL_WIDTH), y=8, anchor="nw")
         tk.Label(header, text="STATUS", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
-            x=WINDOW_WIDTH - ROW_PADDING_X, y=8, anchor="ne")
+            relx=1.0, x=-ROW_PADDING_X, y=8, anchor="ne")
 
     def _start_move(self, event: tk.Event) -> None:
         self._drag_x, self._drag_y = event.x, event.y
@@ -1212,13 +1236,12 @@ class ClaudeMonitorApp:
         if key == self._tray_key:
             return
         self._tray_key = key
-        self.tray.pack_forget()
+        self.tray_inner.pack_forget()
         for w in self.tray_inner.winfo_children():
             w.destroy()
         if not hidden_sessions:
             return
-        self.tray.pack(fill="x", padx=ROW_PADDING_X, pady=(6, 8))
-        self.tray_inner.pack(fill="x")
+        self.tray_inner.pack(fill="x", padx=ROW_PADDING_X, pady=(6, 8))
         head = tk.Frame(self.tray_inner, bg=COLOR_BG)
         head.pack(fill="x")
         tk.Label(head, text=f"非表示中 ({len(hidden_sessions)})", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
@@ -1278,10 +1301,107 @@ class ClaudeMonitorApp:
                 self.rows[info.session_id] = row
             row.pack(fill="x")
             row.update_bg(row_bg)
-            row.update_data(info, info.session_id in self._revealed)
+            row.update_data(info, info.session_id in self._revealed, self._name_col())
 
+        self._fit_scroll_area()
+
+    # -- リサイズ・スクロール ---------------------------------------------
+
+    def _build_scroll_area(self) -> None:
+        """セッション一覧をスクロール可能なCanvasに載せる(高さが足りないとき用)。"""
+        holder = tk.Frame(self.root, bg=COLOR_BG)
+        holder.pack(fill="both", expand=True)
+        self._scrollbar = tk.Scrollbar(holder, orient="vertical")
+        self._scroll = tk.Canvas(holder, bg=COLOR_BG, highlightthickness=0, height=1,
+                                 yscrollcommand=self._scrollbar.set)
+        self._scrollbar.config(command=self._scroll.yview)
+        self._scroll.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self._scroll, bg=COLOR_BG)
+        self._body_window = self._scroll.create_window((0, 0), window=self.body, anchor="nw")
+        self._scroll.bind("<Configure>", self._on_scroll_area_configure)
+        self.body.bind("<Configure>", lambda e: self._scroll.configure(
+            scrollregion=self._scroll.bbox("all")))
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+        self.root.bind_all("<Button-4>", lambda e: self._scroll.yview_scroll(-3, "units"))
+        self.root.bind_all("<Button-5>", lambda e: self._scroll.yview_scroll(3, "units"))
+
+    def _on_wheel(self, event: tk.Event) -> None:
+        step = -1 if event.delta > 0 else 1
+        self._scroll.yview_scroll(step * 3, "units")
+
+    def _on_scroll_area_configure(self, event: tk.Event) -> None:
+        self._scroll.itemconfigure(self._body_window, width=event.width)
+        self._schedule_relayout()
+
+    def _name_col(self) -> int:
+        width = self._scroll.winfo_width()
+        return name_col_width(width if width > 1 else self._width)
+
+    def _schedule_relayout(self) -> None:
+        """幅が変わったら行の配置を計算し直す(ドラッグ中に連打されないよう間引く)。"""
+        if self._relayout_job is not None:
+            self.root.after_cancel(self._relayout_job)
+        self._relayout_job = self.root.after(RELAYOUT_DELAY_MS, self._relayout)
+
+    def _relayout(self) -> None:
+        self._relayout_job = None
+        self._render(self._last_sessions, self._last_error)
+
+    def _fit_scroll_area(self) -> None:
+        """未リサイズなら高さを内容に合わせる(画面内に収まる範囲)。手動リサイズ後は高さを維持し、
+        はみ出す分はスクロールバーで見る。"""
         self.root.update_idletasks()
-        self.root.geometry(f"{WINDOW_WIDTH}x{self.root.winfo_reqheight()}")
+        content_h = self.body.winfo_reqheight()
+        view_h = self._scroll.winfo_height()
+        if not self._user_sized:
+            chrome = self.root.winfo_reqheight() - self._scroll.winfo_reqheight()
+            limit = self.root.winfo_screenheight() - SCREEN_MARGIN_PX
+            self._height = min(chrome + content_h, limit)
+            self.root.geometry(f"{self._width}x{self._height}")
+            self.root.update_idletasks()
+            view_h = self._scroll.winfo_height()
+        overflow = content_h > view_h > 1
+        if overflow and not self._scrollbar.winfo_ismapped():
+            self._scrollbar.pack(side="right", fill="y")
+        elif not overflow and self._scrollbar.winfo_ismapped():
+            self._scrollbar.pack_forget()
+            self._scroll.yview_moveto(0)
+
+    def _build_resize_handles(self) -> None:
+        """枠なしウィンドウ用のリサイズ手段: 右端・下端の帯と右下の角(PWAのような自動折り返しに追従)。"""
+        specs = (
+            ("sb_h_double_arrow", dict(relx=1.0, x=-RESIZE_EDGE_PX, y=0, relheight=1.0,
+                                       width=RESIZE_EDGE_PX), True, False),
+            ("sb_v_double_arrow", dict(rely=1.0, y=-RESIZE_EDGE_PX, x=0, relwidth=1.0,
+                                       height=RESIZE_EDGE_PX), False, True),
+            (CORNER_CURSOR, dict(relx=1.0, rely=1.0, x=-RESIZE_GRIP_PX, y=-RESIZE_GRIP_PX,
+                                width=RESIZE_GRIP_PX, height=RESIZE_GRIP_PX), True, True),
+        )
+        for cursor, place, resize_w, resize_h in specs:
+            handle = tk.Frame(self.root, cursor=cursor, bg=COLOR_BG)
+            handle.place(**place)
+            handle.lift()
+            handle.bind("<ButtonPress-1>", self._start_resize)
+            handle.bind("<B1-Motion>", lambda e, w=resize_w, h=resize_h: self._on_resize(e, w, h))
+            handle.bind("<ButtonRelease-1>", lambda e: self._end_resize())
+
+    def _start_resize(self, event: tk.Event) -> None:
+        self._rs_start = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
+
+    def _on_resize(self, event: tk.Event, resize_w: bool, resize_h: bool) -> None:
+        x0, y0, w0, h0 = self._rs_start
+        width = max(MIN_WINDOW_WIDTH, w0 + (event.x_root - x0)) if resize_w else w0
+        height = max(MIN_WINDOW_HEIGHT, h0 + (event.y_root - y0)) if resize_h else h0
+        self._width, self._height = width, height
+        if resize_h:
+            self._user_sized = True
+        self.root.geometry(f"{width}x{height}")
+
+    def _end_resize(self) -> None:
+        self._prefs.update(width=self._width)
+        if self._user_sized:
+            self._prefs["height"] = self._height
+        save_ui_prefs(self._prefs)
 
     def _blink(self) -> None:
         for row in self.rows.values():
