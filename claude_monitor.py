@@ -29,6 +29,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import messagebox
 import urllib.error
 import urllib.request
@@ -71,7 +72,23 @@ SSH_HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 LOG_PATH = Path.home() / ".claude_monitor" / "app.log"  # pyw起動だとコンソールが無いため、エラーはここに残す
 # リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
 ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
-KICKOFF_PANEL_HEIGHT = 44
+# --- 画面レイアウト(PWAの見た目に合わせた寸法) ---
+WINDOW_WIDTH = 560
+ROW_PADDING_X = 14
+ROW_PADDING_Y = 8
+ROW_NAME_Y = 8
+ROW_HEIGHT_COMPACT = 52
+NAME_LINE_HEIGHT = 22
+CHIP_LINE_HEIGHT = 22
+CHIP_GAP = 4
+CHIP_FONT = ("Segoe UI", 8)
+HEADER_HEIGHT = 28
+BAR_COL_WIDTH = 190
+STATUS_COL_WIDTH = 60
+BAR_TRACK_WIDTH = 70
+NAME_COL_WIDTH = WINDOW_WIDTH - ROW_PADDING_X * 2 - BAR_COL_WIDTH - STATUS_COL_WIDTH
+UI_PREFS_PATH = Path.home() / ".claude_monitor" / "ui.json"  # 画面設定(最前面ピン)
+HIDDEN_PATH = Path.home() / ".claude_monitor" / "hidden.json"  # 「非表示」にしたセッションID
 KICKOFF_STATUS_LABELS = {"success": "成功", "error": "エラー", "skipped": "スキップ"}
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
@@ -660,12 +677,45 @@ class RemoteSessionSource:
             return list(self._sessions), self._error
 
 
+def load_topmost() -> bool:
+    """最前面に固定するか。既定はオフ(他のウィンドウの邪魔をしない)。"""
+    try:
+        return bool(json.loads(UI_PREFS_PATH.read_text(encoding="utf-8")).get("topmost"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def save_topmost(value: bool) -> None:
+    try:
+        UI_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        UI_PREFS_PATH.write_text(json.dumps({"topmost": value}), encoding="utf-8")
+    except OSError as e:
+        logging.error("ui prefs save failed: %s", e)
+
+
+def load_hidden() -> set[str]:
+    try:
+        data = json.loads(HIDDEN_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {x for x in data if isinstance(x, str)} if isinstance(data, list) else set()
+
+
+def save_hidden(hidden: set[str]) -> None:
+    try:
+        HIDDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HIDDEN_PATH.write_text(json.dumps(sorted(hidden)), encoding="utf-8")
+    except OSError as e:
+        logging.error("hidden save failed: %s", e)
+
+
 def format_kickoff_time(iso: str | None) -> str:
     """Hello送信の前回実行時刻(ISO8601)をローカル時刻の短い表記にする。"""
     if not iso:
         return "(まだ実行なし)"
     try:
-        return datetime.fromisoformat(iso).astimezone().strftime("%m/%d %H:%M")
+        d = datetime.fromisoformat(iso).astimezone()
+        return f"{d.year}/{d.month}/{d.day} {d:%H:%M:%S}"
     except ValueError:
         return iso
 
@@ -767,107 +817,168 @@ class SettingsDialog(tk.Toplevel):
 # GUI
 # ---------------------------------------------------------------------------
 
+class Chip(tk.Label):
+    """PWAの小さな枠付きボタン(UUID/非表示/端末など)。"""
+
+    def __init__(self, master: tk.Widget, text: str, command, bg: str = COLOR_TRACK):
+        super().__init__(
+            master, text=text, bg=bg, fg=COLOR_TEXT_DIM, font=CHIP_FONT, padx=5, pady=1,
+            highlightthickness=1, highlightbackground=COLOR_BORDER, cursor="hand2")
+        self._command = command
+        self.bind("<Button-1>", lambda e: self._command())
+        self.bind("<Enter>", lambda e: self.config(fg=COLOR_TEXT, highlightbackground=COLOR_ACCENT))
+        self.bind("<Leave>", lambda e: self.config(fg=COLOR_TEXT_DIM, highlightbackground=COLOR_BORDER))
+
+
+class ToggleSwitch(tk.Canvas):
+    """PWAのスイッチ(46x26の丸角、ON=アクセント色)。"""
+
+    WIDTH, HEIGHT, KNOB = 46, 26, 20
+
+    def __init__(self, master: tk.Widget, bg: str, command):
+        super().__init__(master, width=self.WIDTH, height=self.HEIGHT, bg=bg,
+                         highlightthickness=0, cursor="hand2")
+        self._command = command
+        self._value = False
+        self._enabled = False
+        self.bind("<Button-1>", self._on_click)
+        self._draw()
+
+    def get(self) -> bool:
+        return self._value
+
+    def set(self, value: bool) -> None:
+        self._value = value
+        self._draw()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._draw()
+
+    def _on_click(self, _event: tk.Event) -> None:
+        if not self._enabled:
+            return
+        self.set(not self._value)
+        self._command()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        h = self.HEIGHT
+        track = COLOR_ACCENT if self._value else COLOR_TRACK
+        if not self._enabled:
+            track = COLOR_TRACK
+        self.create_oval(0, 0, h, h, fill=track, outline=track)
+        self.create_oval(self.WIDTH - h, 0, self.WIDTH, h, fill=track, outline=track)
+        self.create_rectangle(h // 2, 0, self.WIDTH - h // 2, h, fill=track, outline=track)
+        pad = (h - self.KNOB) // 2
+        x0 = self.WIDTH - pad - self.KNOB if self._value else pad
+        self.create_oval(x0, pad, x0 + self.KNOB, pad + self.KNOB,
+                         fill="#ffffff" if self._value else COLOR_TEXT_DIM, outline="")
+
+
 class SessionRow(tk.Frame):
-    """1セッション分の行ウィジェット。"""
+    """1セッション分の行ウィジェット(PWAの行と同じ構成: 名前+チップ/パス、バー、ランプ)。"""
 
-    ROW_HEIGHT = 40
-    NAME_WIDTH = 160
-    BAR_WIDTH = 220
-    BAR_TRACK_WIDTH = 70
     LAMP_SIZE = 16
-    TERM_BUTTON_WIDTH = 34
 
-    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn=None):
-        super().__init__(master, bg=bg, height=self.ROW_HEIGHT)
-        self._open_terminal_fn = open_terminal_fn or open_terminal
+    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_hide, on_uuid):
+        super().__init__(master, bg=bg, height=ROW_HEIGHT_COMPACT)
         self.pack_propagate(False)
         self._bg = bg
         self._blink_on = True
-
-        self.name_label = tk.Label(
-            self, text="", bg=bg, fg=COLOR_TEXT,
-            font=("Segoe UI", 10, "bold"), anchor="w",
-        )
-        self.name_label.place(x=14, y=0, width=self.NAME_WIDTH, height=self.ROW_HEIGHT)
-
-        bar_x = 14 + self.NAME_WIDTH + 10
-        self.bar_canvas = tk.Canvas(
-            self, width=self.BAR_WIDTH, height=self.ROW_HEIGHT,
-            bg=bg, highlightthickness=0,
-        )
-        self.bar_canvas.place(x=bar_x, y=0)
-
-        lamp_x = bar_x + self.BAR_WIDTH + 24
-        self.lamp_canvas = tk.Canvas(
-            self, width=self.LAMP_SIZE + 8, height=self.ROW_HEIGHT,
-            bg=bg, highlightthickness=0,
-        )
-        self.lamp_canvas.place(x=lamp_x, y=0)
-
+        self._working = False
         self._attach_cmd = ""
-        self.term_button = tk.Button(
-            self, text="端末", command=self._on_terminal, bd=0, padx=4, pady=0,
-            bg=COLOR_TRACK, fg=COLOR_TEXT_DIM, activebackground=COLOR_TRACK,
-            activeforeground=COLOR_TEXT, font=("Segoe UI", 8), cursor="hand2",
-        )
-        self._term_button_x = lamp_x + self.LAMP_SIZE + 8 + 6
+        self._session_id = ""
+        self._open_terminal_fn = open_terminal_fn
+        self._on_hide = on_hide
+        self._on_uuid = on_uuid
+        self._name_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+
+        self.name_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT, font=self._name_font, anchor="w")
+        self.cwd_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT_DIM, font=("Segoe UI", 8), anchor="w")
+        self.uuid_chip = Chip(self, "UUID", lambda: self._on_uuid(self._session_id), bg)
+        self.hide_chip = Chip(self, "非表示", lambda: self._on_hide(self._session_id), bg)
+        self.term_chip = Chip(self, "端末", self._on_terminal, bg)
+
+        self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=36, bg=bg, highlightthickness=0)
+        self.bar_canvas.place(x=NAME_COL_WIDTH + ROW_PADDING_X, rely=0.5, anchor="w")
+        self.lamp_canvas = tk.Canvas(self, width=self.LAMP_SIZE + 8, height=self.LAMP_SIZE + 8,
+                                     bg=bg, highlightthickness=0)
+        self.lamp_canvas.place(x=WINDOW_WIDTH - ROW_PADDING_X, rely=0.5, anchor="e")
 
     def _on_terminal(self) -> None:
         if not self._open_terminal_fn(self._attach_cmd):
-            self.term_button.config(text="失敗")
-            self.after(1500, lambda: self.term_button.config(text="端末"))
+            self.term_chip.config(text="失敗")
+            self.after(1500, lambda: self.term_chip.config(text="端末"))
 
     def update_bg(self, bg: str) -> None:
-        """最近アクティブ順の並べ替えで行の位置(縞模様)が変わったときに、
-        その行と子ウィジェットの背景色を追従させる。"""
+        """最近アクティブ順の並べ替えで行の位置(縞模様)が変わったときに背景色を追従させる。"""
         if bg == self._bg:
             return
         self._bg = bg
-        self.config(bg=bg)
-        self.name_label.config(bg=bg)
-        self.bar_canvas.config(bg=bg)
-        self.lamp_canvas.config(bg=bg)
+        for w in (self, self.name_label, self.cwd_label, self.uuid_chip, self.hide_chip,
+                  self.term_chip, self.bar_canvas, self.lamp_canvas):
+            w.config(bg=bg)
 
-    def update_data(self, info: SessionInfo) -> None:
-        self.name_label.config(text=info.name)
-        self._draw_bar(info)
-        self._working = info.working
-        self._draw_lamp()
+    def update_data(self, info: SessionInfo, revealed: bool) -> None:
+        self._session_id = info.session_id
         self._attach_cmd = info.attach_cmd
+        self._working = info.working
+        self.name_label.config(text=info.name)
+        self.cwd_label.config(text=info.cwd)
+        self.uuid_chip.config(text=info.session_id if revealed else "UUID")
+        self._draw_bar(info)
+        self._draw_lamp()
+        self._layout(info)
+
+    def _layout(self, info: SessionInfo) -> None:
+        """名前の右にチップを並べ、列幅に収まらなければ次の行へ折り返す(PWAと同じ挙動)。"""
+        name_w = self._name_font.measure(info.name)
+        chips = [self.uuid_chip, self.hide_chip]
         if info.attach_cmd:
-            self.term_button.place(x=self._term_button_x, y=(self.ROW_HEIGHT - 20) // 2,
-                                   width=self.TERM_BUTTON_WIDTH, height=20)
+            chips.append(self.term_chip)
         else:
-            self.term_button.place_forget()
+            self.term_chip.place_forget()
+        max_x = NAME_COL_WIDTH - 4
+        x, y = ROW_PADDING_X + name_w + CHIP_GAP * 2, ROW_NAME_Y
+        wrapped = False
+        self.name_label.place(x=ROW_PADDING_X, y=ROW_NAME_Y, width=name_w + 4, height=NAME_LINE_HEIGHT)
+        for chip in chips:
+            w = chip.winfo_reqwidth()
+            if x + w > max_x and not wrapped:
+                wrapped, x, y = True, ROW_PADDING_X, ROW_NAME_Y + NAME_LINE_HEIGHT + 2
+            elif x + w > max_x:
+                x, y = ROW_PADDING_X, y + CHIP_LINE_HEIGHT
+            chip.place(x=x, y=y, height=CHIP_LINE_HEIGHT - 2)
+            x += w + CHIP_GAP
+        last_y = y if wrapped else ROW_NAME_Y
+        cwd_y = last_y + (CHIP_LINE_HEIGHT if wrapped else NAME_LINE_HEIGHT) + 2
+        self.cwd_label.place(x=ROW_PADDING_X, y=cwd_y, width=NAME_COL_WIDTH - ROW_PADDING_X, height=14)
+        self.config(height=cwd_y + 14 + ROW_PADDING_Y)
 
     def _draw_bar(self, info: SessionInfo) -> None:
         c = self.bar_canvas
         c.delete("all")
-        track_y0, track_y1 = 16, 24
-        track_w = self.BAR_TRACK_WIDTH
-        c.create_rectangle(0, track_y0, track_w, track_y1,
-                            fill=COLOR_TRACK, outline="")
-        fill_w = int(track_w * min(info.context_pct, 100.0) / 100.0)
+        mid = 18
+        track_y0, track_y1 = mid - 4, mid + 4
+        c.create_rectangle(0, track_y0, BAR_TRACK_WIDTH, track_y1, fill=COLOR_TRACK, outline="")
+        fill_w = int(BAR_TRACK_WIDTH * min(info.context_pct, 100.0) / 100.0)
         if fill_w > 0:
-            c.create_rectangle(0, track_y0, fill_w, track_y1,
-                                fill=COLOR_ACCENT, outline="")
-
-        label = (
-            f"{info.context_pct:.0f}% "
-            f"({format_tokens(info.context_tokens)}/{format_tokens(info.context_limit)})"
-        )
-        c.create_text(track_w + 10, (track_y0 + track_y1) // 2 + 6,
-                       text=label, fill=COLOR_TEXT, anchor="w",
-                       font=("Segoe UI", 9, "bold"))
+            c.create_rectangle(0, track_y0, fill_w, track_y1, fill=COLOR_ACCENT, outline="")
+        label = (f"{info.context_pct:.0f}% "
+                 f"({format_tokens(info.context_tokens)}/{format_tokens(info.context_limit)})")
+        c.create_text(BAR_TRACK_WIDTH + 8, mid + 7, text=label, fill=COLOR_TEXT, anchor="w",
+                      font=("Segoe UI", 8))
         if info.model:
-            c.create_text(track_w + 10, (track_y0 + track_y1) // 2 - 8,
-                           text=info.model, fill=COLOR_TEXT_DIM, anchor="w",
-                           font=("Segoe UI", 8))
+            c.create_text(BAR_TRACK_WIDTH + 8, mid - 8, text=info.model, fill=COLOR_TEXT_DIM,
+                          anchor="w", font=("Segoe UI", 7))
 
     def _draw_lamp(self) -> None:
         c = self.lamp_canvas
         c.delete("all")
-        cx, cy, r = (self.LAMP_SIZE + 8) // 2, self.ROW_HEIGHT // 2, self.LAMP_SIZE // 2
+        size = self.LAMP_SIZE + 8
+        cx = cy = size // 2
+        r = self.LAMP_SIZE // 2
         if self._working:
             color = COLOR_RED_ON if self._blink_on else COLOR_RED_OFF
         else:
@@ -876,7 +987,7 @@ class SessionRow(tk.Frame):
 
     def toggle_blink(self) -> None:
         self._blink_on = not self._blink_on
-        if getattr(self, "_working", False):
+        if self._working:
             self._draw_lamp()
 
 
@@ -888,30 +999,32 @@ class ClaudeMonitorApp:
         self._ssh_host = ssh_host
         self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
         self.rows: dict[str, SessionRow] = {}
+        self._hidden: set[str] = load_hidden()
+        self._revealed: set[str] = set()
+        self._last_sessions: list[SessionInfo] = []
+        self._tray_key: tuple = ()
 
         root.overrideredirect(True)
-        root.configure(bg=COLOR_BG)
-        root.attributes("-topmost", True)
-        self.window_width = (
-            14 + SessionRow.NAME_WIDTH + 10 + SessionRow.BAR_WIDTH + 24
-            + SessionRow.LAMP_SIZE + 8 + 6 + SessionRow.TERM_BUTTON_WIDTH + 14
-        )
-        root.geometry(f"{self.window_width}x60+80+80")
+        root.configure(bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        self._topmost = load_topmost()
+        root.attributes("-topmost", self._topmost)
+        root.geometry(f"{WINDOW_WIDTH}x60+80+80")
 
         self._build_titlebar()
-        self._kickoff_height = 0
         self._kickoff_syncing = False
         self._kickoff_result: tuple[bool, bool] | None = None
         if self._remote is not None:
             self._build_kickoff_panel()
         self._build_header()
         self.body = tk.Frame(root, bg=COLOR_BG)
-        self.body.pack(fill="both", expand=True)
+        self.body.pack(fill="x")
 
         self.empty_label = tk.Label(
             self.body, text="アクティブなセッションはありません",
             bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9),
         )
+        self.tray = tk.Frame(root, bg=COLOR_BG, highlightthickness=0)
+        self.tray_inner = tk.Frame(self.tray, bg=COLOR_BG)
 
         self.refresh()
         self._blink()
@@ -924,9 +1037,12 @@ class ClaudeMonitorApp:
         bar.pack_propagate(False)
 
         tk.Label(
-            bar, text="● Claude Code Monitor", bg=COLOR_TITLEBAR,
+            bar, text="●", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT, font=("Segoe UI", 10, "bold"),
+        ).pack(side="left", padx=(14, 0))
+        tk.Label(
+            bar, text="Claude Code Monitor", bg=COLOR_TITLEBAR,
             fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"),
-        ).pack(side="left", padx=12)
+        ).pack(side="left", padx=(6, 0))
 
         close_btn = tk.Label(
             bar, text="✕", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
@@ -936,6 +1052,13 @@ class ClaudeMonitorApp:
         close_btn.bind("<Button-1>", lambda e: self.root.destroy())
         close_btn.bind("<Enter>", lambda e: close_btn.config(fg=COLOR_RED_ON))
         close_btn.bind("<Leave>", lambda e: close_btn.config(fg=COLOR_TEXT_DIM))
+
+        self._pin_btn = tk.Label(
+            bar, text="📌", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM,
+            font=("Segoe UI Emoji", 9), cursor="hand2",
+        )
+        self._pin_btn.pack(side="right", padx=4)
+        self._pin_btn.bind("<Button-1>", lambda e: self._toggle_topmost())
 
         if self._remote is not None:
             settings_btn = tk.Label(
@@ -957,27 +1080,44 @@ class ClaudeMonitorApp:
             widget.bind("<ButtonPress-1>", self._start_move)
             widget.bind("<B1-Motion>", self._on_move)
 
+    def _toggle_topmost(self) -> None:
+        """最前面固定のオン/オフ。枠なしウィンドウはタスクバーに出ないため、切り替え手段を残す。"""
+        self._topmost = not self._topmost
+        self.root.attributes("-topmost", self._topmost)
+        self._pin_btn.config(fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM)
+        save_topmost(self._topmost)
+
     def _build_kickoff_panel(self) -> None:
-        """毎朝4時(JST)のHello送信の状態表示と有効/無効の切り替え(Web版・PWAと同じ内容)。"""
-        self._kickoff_height = KICKOFF_PANEL_HEIGHT
-        panel = tk.Frame(self.root, bg=COLOR_ROW_BG, height=KICKOFF_PANEL_HEIGHT)
-        panel.pack(fill="x", side="top")
-        panel.pack_propagate(False)
-        self._kickoff_var = tk.BooleanVar(value=False)
-        self._kickoff_check = tk.Checkbutton(
-            panel, variable=self._kickoff_var, command=self._on_kickoff_toggle,
-            bg=COLOR_ROW_BG, activebackground=COLOR_ROW_BG, selectcolor=COLOR_TRACK,
-            state="disabled", bd=0)
-        self._kickoff_check.pack(side="right", padx=10)
-        self._kickoff_label = tk.Label(
-            panel, text="毎朝4時(JST) Hello送信: 読み込み中...", bg=COLOR_ROW_BG, fg=COLOR_TEXT_DIM,
-            font=("Segoe UI", 8), justify="left", anchor="w")
-        self._kickoff_label.pack(side="left", padx=12, fill="x", expand=True)
+        """毎朝4時(JST)のHello送信のカード(PWAと同じ: タイトル+状態3行+スイッチ)。"""
+        outer = tk.Frame(self.root, bg=COLOR_BG)
+        outer.pack(fill="x", padx=12, pady=(12, 4))
+        card = tk.Frame(outer, bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        card.pack(fill="x")
+        tk.Label(card, text="毎朝4時(JST) Hello送信", bg=COLOR_TITLEBAR, fg=COLOR_TEXT,
+                 font=("Segoe UI", 10, "bold"), anchor="w", padx=14, pady=8).pack(fill="x")
+        body = tk.Frame(card, bg=COLOR_BG)
+        body.pack(fill="x", padx=14, pady=10)
+        self._kickoff_switch = ToggleSwitch(body, COLOR_BG, self._on_kickoff_toggle)
+        self._kickoff_switch.pack(side="right")
+        info = tk.Frame(body, bg=COLOR_BG)
+        info.pack(side="left", fill="x", expand=True)
+        font = ("Segoe UI", 9)
+        self._kickoff_status = tk.Label(info, text="読み込み中...", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
+                                        font=font, anchor="w")
+        self._kickoff_status.pack(fill="x")
+        self._kickoff_next = tk.Label(info, text="", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font, anchor="w")
+        self._kickoff_next.pack(fill="x")
+        last = tk.Frame(info, bg=COLOR_BG)
+        last.pack(fill="x")
+        self._kickoff_last = tk.Label(last, text="", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font, anchor="w")
+        self._kickoff_last.pack(side="left")
+        self._kickoff_result_label = tk.Label(last, text="", bg=COLOR_BG, fg=COLOR_GREEN, font=font)
+        self._kickoff_result_label.pack(side="left", padx=(4, 0))
 
     def _on_kickoff_toggle(self) -> None:
-        enabled = self._kickoff_var.get()
+        enabled = self._kickoff_switch.get()
         self._kickoff_syncing = True
-        self._kickoff_check.config(state="disabled")
+        self._kickoff_switch.set_enabled(False)
 
         def work() -> None:
             # tkのウィジェットはメインスレッド以外から触らない。結果だけ置き、次のrefreshで反映する
@@ -994,19 +1134,19 @@ class ClaudeMonitorApp:
             self._kickoff_result = None
             self._kickoff_syncing = False
             if not ok:
-                self._kickoff_var.set(not enabled)  # 失敗したので表示を元に戻す
+                self._kickoff_switch.set(not enabled)  # 失敗したので表示を元に戻す
         state = self._remote.get_kickoff()
         if state is None:
             return
-        self._kickoff_var.set(bool(state.get("enabled")))
-        self._kickoff_check.config(state="normal")
+        self._kickoff_switch.set(bool(state.get("enabled")))
+        self._kickoff_switch.set_enabled(True)
         status = state.get("last_status")
-        last = format_kickoff_time(state.get("last_run"))
-        self._kickoff_label.config(
-            text=(f"毎朝4時(JST) Hello送信: {'有効' if state.get('enabled') else '無効'}\n"
-                  f"次回 {state.get('next_run_local') or '-'} / 前回 {last} "
-                  f"{KICKOFF_STATUS_LABELS.get(status, status or '-')}"),
-            fg=COLOR_ERROR if status == "error" else COLOR_TEXT_DIM)
+        self._kickoff_status.config(text=f"状態: {'有効' if state.get('enabled') else '無効'}")
+        self._kickoff_next.config(text=f"次回実行(予定): {state.get('next_run_local') or '-'}")
+        self._kickoff_last.config(text=f"前回実行: {format_kickoff_time(state.get('last_run'))}")
+        self._kickoff_result_label.config(
+            text=KICKOFF_STATUS_LABELS.get(status, status or "-"),
+            fg={"success": COLOR_GREEN, "error": COLOR_RED_ON}.get(status, COLOR_TEXT_DIM))
 
     def open_settings(self) -> None:
         """接続設定ダイアログを開き、保存されたら即座に接続し直す。"""
@@ -1027,17 +1167,16 @@ class ClaudeMonitorApp:
         self._remote.configure(dialog.result["server"], dialog.result["token"])
 
     def _build_header(self) -> None:
-        header = tk.Frame(self.root, bg=COLOR_BG, height=24)
+        header = tk.Frame(self.root, bg=COLOR_BG, height=HEADER_HEIGHT)
         header.pack(fill="x")
         header.pack_propagate(False)
-        bar_x = 14 + SessionRow.NAME_WIDTH + 10
-        lamp_x = bar_x + SessionRow.BAR_WIDTH + 24
-        tk.Label(header, text="SESSION", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
-                  font=("Segoe UI", 8)).place(x=14, y=4)
-        tk.Label(header, text="CONTEXT USED", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
-                  font=("Segoe UI", 8)).place(x=bar_x, y=4)
-        tk.Label(header, text="STATUS", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
-                  font=("Segoe UI", 8)).place(x=lamp_x - 20, y=4)
+        font = ("Segoe UI", 8)
+        tk.Label(header, text="SESSION", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
+            x=ROW_PADDING_X, y=8)
+        tk.Label(header, text="CONTEXT USED", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
+            x=NAME_COL_WIDTH + ROW_PADDING_X, y=8)
+        tk.Label(header, text="STATUS", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
+            x=WINDOW_WIDTH - ROW_PADDING_X, y=8, anchor="ne")
 
     def _start_move(self, event: tk.Event) -> None:
         self._drag_x, self._drag_y = event.x, event.y
@@ -1047,6 +1186,50 @@ class ClaudeMonitorApp:
         y = self.root.winfo_y() + (event.y - self._drag_y)
         self.root.geometry(f"+{x}+{y}")
 
+    # -- 非表示・UUID表示(PWAと同じ。非表示は保存して次回起動時にも保持) ----------
+
+    def _hide_session(self, session_id: str) -> None:
+        self._hidden.add(session_id)
+        save_hidden(self._hidden)
+        self._render(self._last_sessions, self._last_error)
+
+    def _unhide_session(self, session_id: str) -> None:
+        self._hidden.discard(session_id)
+        save_hidden(self._hidden)
+        self._render(self._last_sessions, self._last_error)
+
+    def _unhide_all(self) -> None:
+        self._hidden.clear()
+        save_hidden(self._hidden)
+        self._render(self._last_sessions, self._last_error)
+
+    def _toggle_uuid(self, session_id: str) -> None:
+        self._revealed.symmetric_difference_update({session_id})
+        self._render(self._last_sessions, self._last_error)
+
+    def _render_tray(self, hidden_sessions: list[SessionInfo]) -> None:
+        key = tuple(s.session_id for s in hidden_sessions)
+        if key == self._tray_key:
+            return
+        self._tray_key = key
+        self.tray.pack_forget()
+        for w in self.tray_inner.winfo_children():
+            w.destroy()
+        if not hidden_sessions:
+            return
+        self.tray.pack(fill="x", padx=ROW_PADDING_X, pady=(6, 8))
+        self.tray_inner.pack(fill="x")
+        head = tk.Frame(self.tray_inner, bg=COLOR_BG)
+        head.pack(fill="x")
+        tk.Label(head, text=f"非表示中 ({len(hidden_sessions)})", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
+                 font=("Segoe UI", 8)).pack(side="left")
+        Chip(head, "すべて戻す", self._unhide_all, COLOR_BG).pack(side="right")
+        chips = tk.Frame(self.tray_inner, bg=COLOR_BG)
+        chips.pack(fill="x", pady=(4, 0))
+        for s in hidden_sessions:
+            Chip(chips, f"{s.name}  ✕", lambda sid=s.session_id: self._unhide_session(sid),
+                 COLOR_TRACK).pack(side="left", padx=(0, 4), pady=2)
+
     # -- データ更新 -----------------------------------------------------
 
     def refresh(self) -> None:
@@ -1054,45 +1237,51 @@ class ClaudeMonitorApp:
             sessions, error = self._remote.get()
         else:
             sessions, error = get_sessions(), None
-        self.empty_label.config(
-            text=error or "アクティブなセッションはありません",
-            fg=COLOR_ERROR if error else COLOR_TEXT_DIM)
         self._update_kickoff_panel()
-        seen_ids = {s.session_id for s in sessions}
+        self._render(sessions, error)
+        self.root.after(POLL_INTERVAL_MS, self.refresh)
 
-        # 消えたセッションの行を削除
+    def _render(self, sessions: list[SessionInfo], error: str | None) -> None:
+        self._last_sessions, self._last_error = sessions, error
+        visible = [s for s in sessions if s.session_id not in self._hidden]
+        if error:
+            empty_text, empty_fg = error, COLOR_ERROR
+        elif not sessions:
+            empty_text, empty_fg = "アクティブなセッションはありません", COLOR_TEXT_DIM
+        else:
+            empty_text, empty_fg = "表示中のセッションはありません(下の「非表示中」欄から戻せます)", COLOR_TEXT_DIM
+        self.empty_label.config(text=empty_text, fg=empty_fg)
+        self._render_tray([s for s in sessions if s.session_id in self._hidden])
+
+        seen_ids = {s.session_id for s in visible}
+        # 消えた(または非表示にした)セッションの行を削除
         for sid in list(self.rows.keys()):
             if sid not in seen_ids:
                 self.rows.pop(sid).destroy()
 
-        if not sessions or error:
-            self.empty_label.pack(fill="x", pady=10)
+        if not visible or error:
+            self.empty_label.pack(fill="x", pady=12)
         else:
             self.empty_label.pack_forget()
 
-        # get_sessions()は最近アクティブ順に並んでいるが、pack()は既存ウィジェットを
-        # 再度呼んでも並び順を変えないため、いったん全行を配置解除してから
-        # 新しい順序で詰め直す(rows dict自体は使い回し、再生成はしない)。
+        # pack()は既存ウィジェットを再度呼んでも並び順を変えないため、いったん全行を
+        # 配置解除してから新しい順序で詰め直す(rows dict自体は使い回し、再生成はしない)。
         for row in self.rows.values():
             row.pack_forget()
 
-        for idx, info in enumerate(sessions):
+        for idx, info in enumerate(visible):
             row_bg = COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG
             row = self.rows.get(info.session_id)
             if row is None:
-                row = SessionRow(self.body, row_bg, self._open_terminal_fn)
+                row = SessionRow(self.body, row_bg, self._open_terminal_fn,
+                                 self._hide_session, self._toggle_uuid)
                 self.rows[info.session_id] = row
             row.pack(fill="x")
             row.update_bg(row_bg)
-            row.update_data(info)
+            row.update_data(info, info.session_id in self._revealed)
 
-        show_label = not sessions or bool(error)
-        new_height = (34 + self._kickoff_height + 24 + len(sessions) * SessionRow.ROW_HEIGHT
-                      + (SessionRow.ROW_HEIGHT if show_label and not sessions else 0)
-                      + (20 if show_label else 0))
-        self.root.geometry(f"{self.window_width}x{new_height}")
-
-        self.root.after(POLL_INTERVAL_MS, self.refresh)
+        self.root.update_idletasks()
+        self.root.geometry(f"{WINDOW_WIDTH}x{self.root.winfo_reqheight()}")
 
     def _blink(self) -> None:
         for row in self.rows.values():
