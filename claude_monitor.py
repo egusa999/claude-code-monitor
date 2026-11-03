@@ -721,17 +721,6 @@ def save_hidden(hidden: set[str]) -> None:
         logging.error("hidden save failed: %s", e)
 
 
-def format_kickoff_time(iso: str | None) -> str:
-    """Hello送信の前回実行時刻(ISO8601)をローカル時刻の短い表記にする。"""
-    if not iso:
-        return "(まだ実行なし)"
-    try:
-        d = datetime.fromisoformat(iso).astimezone()
-        return f"{d.year}/{d.month}/{d.day} {d:%H:%M:%S}"
-    except ValueError:
-        return iso
-
-
 def normalize_server_url(raw: str) -> str:
     """入力されたサーバーURLを整える。スキーム省略時はhttps(実運用はTLS)。不正ならValueError。"""
     url = raw.strip().rstrip("/")
@@ -1111,31 +1100,20 @@ class ClaudeMonitorApp:
         save_ui_prefs(self._prefs)
 
     def _build_kickoff_panel(self) -> None:
-        """毎朝4時(JST)のHello送信のカード(PWAと同じ: タイトル+状態3行+スイッチ)。"""
+        """毎朝4時(JST)のHello送信を1行で表示する: タイトル + 前回の結果(成功/エラー) + スイッチ。"""
         outer = tk.Frame(self.root, bg=COLOR_BG)
-        outer.pack(fill="x", padx=12, pady=(12, 4))
+        outer.pack(fill="x", padx=12, pady=(10, 2))
         card = tk.Frame(outer, bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         card.pack(fill="x")
-        tk.Label(card, text="毎朝4時(JST) Hello送信", bg=COLOR_TITLEBAR, fg=COLOR_TEXT,
-                 font=("Segoe UI", 10, "bold"), anchor="w", padx=14, pady=8).pack(fill="x")
         body = tk.Frame(card, bg=COLOR_BG)
-        body.pack(fill="x", padx=14, pady=10)
+        body.pack(fill="x", padx=14, pady=8)
         self._kickoff_switch = ToggleSwitch(body, COLOR_BG, self._on_kickoff_toggle)
         self._kickoff_switch.pack(side="right")
-        info = tk.Frame(body, bg=COLOR_BG)
-        info.pack(side="left", fill="x", expand=True)
-        font = ("Segoe UI", 9)
-        self._kickoff_status = tk.Label(info, text="読み込み中...", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
-                                        font=font, anchor="w")
-        self._kickoff_status.pack(fill="x")
-        self._kickoff_next = tk.Label(info, text="", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font, anchor="w")
-        self._kickoff_next.pack(fill="x")
-        last = tk.Frame(info, bg=COLOR_BG)
-        last.pack(fill="x")
-        self._kickoff_last = tk.Label(last, text="", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font, anchor="w")
-        self._kickoff_last.pack(side="left")
-        self._kickoff_result_label = tk.Label(last, text="", bg=COLOR_BG, fg=COLOR_GREEN, font=font)
-        self._kickoff_result_label.pack(side="left", padx=(4, 0))
+        tk.Label(body, text="毎朝4時(JST) Hello送信", bg=COLOR_BG, fg=COLOR_TEXT,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        self._kickoff_result_label = tk.Label(body, text="", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
+                                              font=("Segoe UI", 9, "bold"))
+        self._kickoff_result_label.pack(side="left", padx=(10, 0))
 
     def _on_kickoff_toggle(self) -> None:
         enabled = self._kickoff_switch.get()
@@ -1164,11 +1142,8 @@ class ClaudeMonitorApp:
         self._kickoff_switch.set(bool(state.get("enabled")))
         self._kickoff_switch.set_enabled(True)
         status = state.get("last_status")
-        self._kickoff_status.config(text=f"状態: {'有効' if state.get('enabled') else '無効'}")
-        self._kickoff_next.config(text=f"次回実行(予定): {state.get('next_run_local') or '-'}")
-        self._kickoff_last.config(text=f"前回実行: {format_kickoff_time(state.get('last_run'))}")
         self._kickoff_result_label.config(
-            text=KICKOFF_STATUS_LABELS.get(status, status or "-"),
+            text=KICKOFF_STATUS_LABELS.get(status, status or ""),
             fg={"success": COLOR_GREEN, "error": COLOR_RED_ON}.get(status, COLOR_TEXT_DIM))
 
     def open_settings(self) -> None:
