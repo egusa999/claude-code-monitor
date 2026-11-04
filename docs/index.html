@@ -219,20 +219,32 @@
     color: var(--text-dim);
     font-size: 13px;
   }
-  .kickoff-panel {
-    width: 100%;
-    max-width: 560px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    margin-bottom: 14px;
-  }
-  .kickoff-titlebar {
-    background: var(--titlebar);
+  /* プラン使用量(Claude Usageアプリと同じ表)。一覧(#rows)だけがスクロールし、ここは常に見える */
+  .usage {
+    display: grid;
+    grid-template-columns: auto minmax(30px, 1fr) 44px 52px 64px 84px;
+    column-gap: 8px;
+    row-gap: 8px;
+    align-items: center;
     padding: 10px 14px;
-    font-weight: 600;
-    font-size: 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .usage .uh { font-size: 10px; color: var(--text-dim); letter-spacing: 0.03em; text-align: center; white-space: nowrap; }
+  .usage .uh.used { grid-column: span 2; }
+  .usage .uerr { font-size: 10px; color: #ff4d4d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .usage .ulabel { font-weight: 600; color: var(--text-dim); white-space: nowrap; letter-spacing: 0.03em; }
+  .usage .ulabel .short { display: none; }
+  .usage .ubar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .usage .ubar > div { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+  .usage .upct { font-weight: 700; font-size: 14px; text-align: right; font-variant-numeric: tabular-nums; }
+  .usage .uring { display: flex; justify-content: center; }
+  .usage .uin { font-weight: 700; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .usage .uat { color: var(--text-dim); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  @media (max-width: 480px) {
+    .usage .ulabel .long { display: none; }
+    .usage .ulabel .short { display: inline; }
+    .usage .uh.used .long { display: none; }
   }
   .titlebar button {
     background: none;
@@ -242,19 +254,26 @@
     font-size: 12px;
     padding: 3px 8px;
     cursor: pointer;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .titlebar button:hover { color: var(--text); border-color: var(--accent); }
-  .kickoff-body {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 14px;
-    gap: 12px;
-  }
-  .kickoff-info { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
-  .kickoff-info .status-success { color: var(--green); }
-  .kickoff-info .status-error { color: var(--red-on); }
-  .kickoff-info .status-skipped { color: var(--text-dim); }
+  .titlebar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .hello { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); cursor: default; }
+  .hello.status-success { color: var(--green); }
+  .hello.status-error { color: var(--red-on); }
+  .switch.mini { width: 30px; height: 16px; }
+  .switch.mini .slider::before { width: 12px; height: 12px; left: 2px; top: 2px; }
+  .switch.mini input:checked + .slider::before { transform: translateX(14px); }
+  /* 一覧だけをスクロールさせる(タイトルバー・使用量・見出し・非表示トレイは固定) */
+  .panel { display: flex; flex-direction: column; }
+  .panel > * { flex-shrink: 0; }
+  .panel > #rows { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+  /* 初回にウィンドウを内容へ合わせた後(size-locked)だけ高さを画面に収め、はみ出す分を一覧内でスクロールする */
+  body.size-locked { height: 100vh; height: 100dvh; }
+  body.size-locked #app { min-height: 0; }
   .switch {
     position: relative;
     display: inline-block;
@@ -338,21 +357,12 @@
 
   <div id="app" hidden style="width:100%;display:flex;flex-direction:column;align-items:center;">
     <div id="conn-error" class="conn-error" hidden>サーバーに接続できません(起動状態・アドレスを確認してください)</div>
-    <div class="kickoff-panel">
-      <div class="kickoff-titlebar">毎朝4時(JST) Hello送信</div>
-      <div class="kickoff-body">
-        <div class="kickoff-info" id="kickoff-info">読み込み中...</div>
-        <label class="switch">
-          <input type="checkbox" id="kickoff-toggle" disabled>
-          <span class="slider"></span>
-        </label>
-      </div>
-    </div>
     <div class="panel">
       <div class="titlebar">
         <span><span class="dot">&#9679;</span>Claude Code Monitor</span>
-        <button id="change-address" type="button">接続先: <span id="current-address"></span> (変更)</button>
+        <span class="titlebar-actions"><span class="hello" id="hello" title="毎朝4時(JST) Hello送信">Hello<label class="switch mini"><input type="checkbox" id="kickoff-toggle" disabled><span class="slider"></span></label></span><button id="change-address" type="button">接続先: <span id="current-address"></span> (変更)</button></span>
       </div>
+      <div class="usage" id="usage"></div>
       <div class="header">
         <span>SESSION</span><span>CONTEXT USED</span><span style="text-align:right">STATUS</span>
       </div>
@@ -425,7 +435,7 @@ function showSetup(prefill) {
   setupError.textContent = '';
   setupInput.focus();
   lastFitHeight = 0;
-  appSizeLocked = false;
+  appSizeLocked = false; document.body.classList.remove('size-locked');
   fitWindowToContent();
 }
 
@@ -680,14 +690,80 @@ async function refresh() {
     lastSessions = data.sessions;
     renderRows(lastLimit, lastSessions);
     setConnError(false);
+    refreshUsage(false);
   } catch (e) {
     setConnError(true);
   }
 }
 
+// --- プラン使用量(5時間セッション枠・週の上限)。サーバーの /api/usage は60秒キャッシュなので同じ間隔で取り直し、
+// 残り時間・経過率は表示のたびに手元の時計で計算する。
+const USAGE_POLL_MS = 60000;
+const USAGE_ROWS = [
+  ['session', 'CURRENT SESSION', 'SESSION', '#8b6cf6'],
+  ['weekly', 'WEEKLY LIMIT', 'WEEKLY', '#4f8ff7'],
+];
+const RING_RADIUS = 8;
+const usageEl = document.getElementById('usage');
+let lastUsage = {};
+let lastUsageFetch = 0;
+function formatRemaining(sec) {
+  const minutes = Math.max(Math.floor(sec / 60), 0);
+  const days = Math.floor(minutes / 1440), hours = Math.floor((minutes % 1440) / 60), mins = minutes % 60;
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+function ringSvg(frac, color) {
+  const c = 2 * Math.PI * RING_RADIUS;
+  const arc = frac > 0 ? `<circle cx="10" cy="10" r="${RING_RADIUS}" fill="none" stroke="${color}" stroke-width="3" stroke-dasharray="${(c * frac).toFixed(2)} ${c.toFixed(2)}" transform="rotate(-90 10 10)"/>` : '';
+  return `<svg width="20" height="20" viewBox="0 0 20 20"><circle cx="10" cy="10" r="${RING_RADIUS}" fill="none" stroke="var(--track)" stroke-width="3"/>${arc}</svg>`;
+}
+function pad2(n) { return String(n).padStart(2, '0'); }
+function renderUsage() {
+  const now = Date.now();
+  let html = `<div class="uerr">${lastUsage.error ? escapeHtml(lastUsage.error) : ''}</div>`
+    + '<div class="uh used"><span class="long">SESSION </span>USED</div><div class="uh">ELAPSED</div>'
+    + '<div class="uh">RESETS IN</div><div class="uh">RESETS AT</div>';
+  for (const [key, label, short, color] of USAGE_ROWS) {
+    const item = lastUsage[key];
+    html += `<div class="ulabel"><span class="long">${label}</span><span class="short">${short}</span></div>`;
+    if (!item || typeof item.pct !== 'number') {
+      html += `<div class="ubar"></div><div class="upct">—</div><div class="uring">${ringSvg(0, color)}</div><div class="uin">—</div><div class="uat">—</div>`;
+      continue;
+    }
+    const pct = Math.min(Math.max(item.pct, 0), 100);
+    const resets = item.resets_at ? new Date(item.resets_at) : null;
+    const valid = resets && !isNaN(resets.getTime());
+    const remaining = valid ? (resets.getTime() - now) / 1000 : 0;
+    const elapsed = valid && item.window_sec > 0 ? Math.min(Math.max(1 - remaining / item.window_sec, 0), 1) : 0;
+    const at = !valid ? '—' : key === 'session'
+      ? `${pad2(resets.getHours())}:${pad2(resets.getMinutes())}`
+      : `${resets.getMonth() + 1}/${resets.getDate()} ${pad2(resets.getHours())}:${pad2(resets.getMinutes())}`;
+    html += `<div class="ubar"><div style="width:${pct}%;background:${color}"></div></div>`
+      + `<div class="upct">${Math.round(pct)}%</div><div class="uring">${ringSvg(elapsed, color)}</div>`
+      + `<div class="uin">${valid && remaining > 0 ? formatRemaining(remaining) : '—'}</div><div class="uat">${at}</div>`;
+  }
+  usageEl.innerHTML = html;
+}
+async function refreshUsage(force) {
+  if (!force && Date.now() - lastUsageFetch < USAGE_POLL_MS) { renderUsage(); return; }
+  lastUsageFetch = Date.now();
+  const keep = Object.fromEntries(Object.entries(lastUsage).filter(([k]) => k !== 'error'));
+  try {
+    const res = await apiFetch(baseUrl + '/api/usage', { cache: 'no-store' });
+    const data = await res.json();
+    // 取得に失敗しても前回値は消さず、エラー文言だけ差し替える
+    lastUsage = (data.session || data.weekly) ? data : { ...keep, error: data.error || `HTTP ${res.status}` };
+  } catch (e) {
+    lastUsage = { ...keep, error: '使用量を取得できません' };
+  }
+  renderUsage();
+}
+
 const STATUS_LABELS = { success: '成功', error: 'エラー', skipped: 'スキップ' };
 const kickoffToggle = document.getElementById('kickoff-toggle');
-const kickoffInfo = document.getElementById('kickoff-info');
+const helloEl = document.getElementById('hello');
 let kickoffSyncing = false;
 
 function formatLocal(iso) {
@@ -698,13 +774,10 @@ function formatLocal(iso) {
 function renderKickoff(state) {
   kickoffToggle.checked = !!state.enabled;
   kickoffToggle.disabled = false;
-  const statusClass = state.last_status ? `status-${state.last_status}` : '';
   const statusLabel = state.last_status ? (STATUS_LABELS[state.last_status] || state.last_status) : '-';
-  kickoffInfo.innerHTML = `
-    状態: ${state.enabled ? '有効' : '無効'}<br>
-    次回実行(予定): ${escapeHtml(state.next_run_local || '-')}<br>
-    前回実行: ${formatLocal(state.last_run)} <span class="${statusClass}">${escapeHtml(statusLabel)}</span>
-  `;
+  helloEl.className = 'hello' + (state.last_status ? ` status-${state.last_status}` : '');
+  helloEl.title = `毎朝4時(JST) Hello送信: ${state.enabled ? '有効' : '無効'}\n`
+    + `次回実行(予定): ${state.next_run_local || '-'}\n前回実行: ${formatLocal(state.last_run)} ${statusLabel}`;
   fitWindowToContent();
 }
 
@@ -715,7 +788,8 @@ async function refreshKickoff() {
     if (!res.ok) throw new Error('kickoff status unavailable');
     renderKickoff(await res.json());
   } catch (e) {
-    kickoffInfo.textContent = '状態を取得できません(daily_kickoff.py 未検出、またはサーバーに接続できません)';
+    helloEl.className = 'hello';
+    helloEl.title = '状態を取得できません(daily_kickoff.py 未検出、またはサーバーに接続できません)';
   }
 }
 
@@ -745,10 +819,11 @@ function startApp(url) {
   setupEl.hidden = true;
   appEl.hidden = false;
   lastFitHeight = 0;
-  appSizeLocked = false;
-  Promise.all([refresh(), refreshKickoff()]).then(() => {
+  appSizeLocked = false; document.body.classList.remove('size-locked');
+  lastUsage = {};
+  Promise.all([refresh(), refreshKickoff(), refreshUsage(true)]).then(() => {
     // 初回表示のレイアウトが確定した後にサイズを固定する
-    setTimeout(() => { appSizeLocked = true; }, 300);
+    setTimeout(() => { appSizeLocked = true; document.body.classList.add('size-locked'); }, 300);
   });
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => { refresh(); refreshKickoff(); }, POLL_INTERVAL_MS);
@@ -757,7 +832,7 @@ function startApp(url) {
 // タブ/ウィンドウが非表示の間はブラウザがsetIntervalを大幅に間引くため、
 // 表示状態に戻ったタイミングで即座に再取得して古い表示のまま放置しない。
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); }
+  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); refreshUsage(false); }
 });
 
 // 初期化: 保存済みアドレスがあれば自動接続、なければ入力フォームを表示
