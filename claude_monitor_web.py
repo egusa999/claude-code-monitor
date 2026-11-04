@@ -25,6 +25,7 @@ import json
 import ssl
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +46,11 @@ DEFAULT_TOKEN_FILE = "/etc/claude-monitor/token"  # /api/* に必須のBearerト
 API_PATH_PREFIX = "/api/"
 BEARER_PREFIX = "Bearer "
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# --- 接続の保護(中途半端な接続1本でサーバー全体が止まらないようにする) ---
+HANDSHAKE_TIMEOUT_SEC = 5        # TLSハンドシェイクの待ち上限
+REQUEST_TIMEOUT_SEC = 15         # リクエスト読み取り・応答書き込みの各ソケット操作の待ち上限
+REQUEST_QUEUE_SIZE = 128         # listenのbacklog(既定の5だと受け付け待ちがすぐ満杯になる)
+MAX_CONCURRENT_CONNECTIONS = 64  # 同時に処理する接続数の上限(超過分は即切断してスレッド枯渇を防ぐ)
 MIN_TOKEN_LENGTH = 32  # これ未満のトークンは推測されやすいので起動を拒否する
 HTTP_UNAUTHORIZED = 401
 
@@ -705,7 +711,40 @@ def load_token(path: str) -> str | None:
     return token
 
 
+class MonitorServer(ThreadingHTTPServer):
+    """接続ごとにスレッドで処理するHTTP(S)サーバー。
+
+    TLSは待受ソケットではなく「接続ごとのスレッド」でラップする。待受ソケットをラップすると
+    ハンドシェイクがaccept()内(=メインループ)で行われ、途中で止まった接続1本が全体を塞ぐ。
+    """
+
+    daemon_threads = True
+    request_queue_size = REQUEST_QUEUE_SIZE
+
+    def __init__(self, address, handler, ssl_context: ssl.SSLContext | None = None):
+        super().__init__(address, handler)
+        self._ssl_context = ssl_context
+        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
+
+    def process_request_thread(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            if self._ssl_context is not None:
+                request.settimeout(HANDSHAKE_TIMEOUT_SEC)
+                try:
+                    request = self._ssl_context.wrap_socket(request, server_side=True)
+                except (OSError, ssl.SSLError):  # ハンドシェイクの失敗・タイムアウト・切断
+                    self.shutdown_request(request)
+                    return
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class MonitorHandler(BaseHTTPRequestHandler):
+    timeout = REQUEST_TIMEOUT_SEC  # 無送信のまま居座る接続を切る(StreamRequestHandler.setupが適用)
     token: str | None = None  # Noneなら認証なし(ループバック待受のときのみ許可。main()で検証)
 
     def _authorized(self) -> bool:
@@ -831,13 +870,13 @@ def main() -> None:
         sys.exit(f"認証トークンがありません: {args.token_file} を作成してください"
                  "(ループバック以外で認証なしの公開はしません)")
 
-    server = ThreadingHTTPServer((args.host, args.port), MonitorHandler)
+    ctx = None
     scheme = "http"
     if args.cert and args.key:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=args.cert, keyfile=args.key)
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
         scheme = "https"
+    server = MonitorServer((args.host, args.port), MonitorHandler, ctx)
     print(f"Claude Code Monitor (Web) を起動しました: {scheme}://{args.host}:{args.port}")
     print("終了する場合は Ctrl+C")
     try:
