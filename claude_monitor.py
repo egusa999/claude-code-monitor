@@ -91,6 +91,24 @@ MIN_WINDOW_WIDTH = 420
 MIN_WINDOW_HEIGHT = 200
 SCROLLBAR_WIDTH_PX = 8
 SCROLLBAR_STYLE = "Monitor.Vertical.TScrollbar"
+# プラン使用量パネル(Claude Usageアプリと同じ表。スクロール領域の外に固定)
+USAGE_PANEL_HEIGHT = 76
+USAGE_HEADER_Y = 10
+USAGE_FIRST_ROW_Y = 32
+USAGE_ROW_HEIGHT = 26
+USAGE_PCT_WIDTH = 44          # バー右の "100%" の幅
+USAGE_RING_COL_WIDTH = 56
+USAGE_IN_COL_WIDTH = 64
+USAGE_AT_COL_WIDTH = 76
+USAGE_AT_SAMPLE = "12/31 23:59"  # RESETS AT列の最長表記(列幅の実測用)
+USAGE_COL_GAP = 8
+USAGE_MIN_BAR_WIDTH = 30
+USAGE_BAR_HALF = 3            # バーの太さの半分
+USAGE_RING_RADIUS = 8
+USAGE_RING_WIDTH = 3
+USAGE_SESSION_COLOR = "#8b6cf6"  # Claude Usageアプリ同様、セッション=紫・週=青
+USAGE_WEEKLY_COLOR = "#4f8ff7"
+TITLE_SWITCH_SIZE = (30, 16, 12)  # タイトルバーのHelloスイッチ(幅, 高さ, つまみ)
 RESIZE_EDGE_PX = 5      # 右端・下端のドラッグ可能な帯の太さ
 SCREEN_MARGIN_PX = 80   # 自動で高さを合わせるとき、画面の高さから残す余白
 
@@ -100,7 +118,6 @@ def name_col_width(window_width: int) -> int:
     return window_width - ROW_PADDING_X * 2 - BAR_COL_WIDTH - STATUS_COL_WIDTH
 UI_PREFS_PATH = Path.home() / ".claude_monitor" / "ui.json"  # 画面設定(最前面ピン)
 HIDDEN_PATH = Path.home() / ".claude_monitor" / "hidden.json"  # 「非表示」にしたセッションID
-KICKOFF_STATUS_LABELS = {"success": "成功", "error": "エラー", "skipped": "スキップ"}
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
 SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
@@ -564,6 +581,94 @@ def get_sessions() -> list[SessionInfo]:
     return sorted(sessions, key=lambda s: s.last_active, reverse=True)
 
 
+# --- プラン使用量(5時間セッション枠・週の上限)。Claude Usageアプリと同じ値 ---------------
+# Claude Codeがログインに使うOAuthトークン(~/.claude/.credentials.json)で取得する。
+# トークンの更新(refresh)はClaude Code本体に任せ、ここでは読むだけにする
+# (こちらでrefreshするとrefreshTokenが回転し、Claude Code側のログインを壊しうるため)。
+CREDENTIALS_PATH = HOME / ".claude" / ".credentials.json"
+USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_API_BETA = "oauth-2025-04-20"
+USAGE_CACHE_SEC = 60.0          # API呼び出しの最短間隔(レート制限への配慮。表示の残り時間は手元で毎秒計算する)
+USAGE_FETCH_TIMEOUT_SEC = 10
+# (APIのキー, 表示用キー, 枠の長さ[秒]) 経過率(ELAPSED)の計算に使う
+USAGE_WINDOWS: tuple[tuple[str, str, int], ...] = (
+    ("five_hour", "session", 5 * 3600),
+    ("seven_day", "weekly", 7 * 24 * 3600),
+)
+_usage_lock = threading.Lock()
+_usage_cache: dict = {}
+_usage_cache_at = 0.0
+
+
+def _fetch_plan_usage_uncached() -> dict:
+    try:
+        oauth = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))["claudeAiOauth"]
+        token = oauth["accessToken"]
+        expires_ms = float(oauth.get("expiresAt") or 0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"error": "Claude Codeのログイン情報がありません"}
+    if expires_ms and expires_ms / 1000.0 < time.time():
+        return {"error": "ログイン情報の期限切れ(Claude Code起動で更新)"}
+    req = urllib.request.Request(USAGE_API_URL, headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": USAGE_API_BETA,
+        "User-Agent": "claude-code-monitor"})
+    try:
+        with urllib.request.urlopen(req, timeout=USAGE_FETCH_TIMEOUT_SEC) as res:
+            raw = json.load(res)
+    except urllib.error.HTTPError as e:
+        return {"error": f"使用量API HTTP {e.code}"}
+    except (OSError, ValueError):
+        return {"error": "使用量APIに接続できません"}
+    result: dict = {}
+    for api_key, key, window_sec in USAGE_WINDOWS:
+        item = raw.get(api_key) if isinstance(raw, dict) else None
+        if not isinstance(item, dict) or item.get("utilization") is None:
+            continue
+        result[key] = {"pct": float(item["utilization"]), "resets_at": item.get("resets_at"),
+                       "window_sec": window_sec}
+    if not result:
+        return {"error": "使用量データがありません"}
+    return result
+
+
+def fetch_plan_usage() -> dict:
+    """{"session"|"weekly": {"pct", "resets_at"(ISO8601), "window_sec"}} を返す。
+    失敗時は"error"を付け、前回取得できた値があればそれも残す(表示を消さない)。"""
+    global _usage_cache, _usage_cache_at
+    with _usage_lock:
+        if _usage_cache and time.time() - _usage_cache_at < USAGE_CACHE_SEC:
+            return dict(_usage_cache)
+        fresh = _fetch_plan_usage_uncached()
+        if "error" in fresh:
+            previous = {k: v for k, v in _usage_cache.items() if k != "error"}
+            fresh = {**previous, **fresh}
+        _usage_cache, _usage_cache_at = fresh, time.time()
+        return dict(fresh)
+
+
+def parse_iso_utc(value) -> datetime | None:
+    """ISO8601文字列をaware datetimeにする(不正ならNone)。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def format_remaining(seconds: float) -> str:
+    """残り時間をClaude Usageアプリと同じ粒度で表す(例: 4h 19m / 5d 2h / 12m)。"""
+    minutes = max(int(seconds // 60), 0)
+    days, rem = divmod(minutes, 24 * 60)
+    hours, mins = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
 # 接続コマンドを新しい端末ウィンドウで実行する。上から順に、最初に見つかったものを使う。
 # (端末エミュレータ名, コマンドの前に付ける引数)
 _POSIX_TERMINALS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -689,6 +794,62 @@ class RemoteSessionSource:
         """(直近に取得できた一覧, 接続エラー文言またはNone)。"""
         with self._lock:
             return list(self._sessions), self._error
+
+    def fetch_usage(self) -> dict:
+        """サーバーの`/api/usage`(プラン使用量)を取得する(呼び出し元のスレッドでブロックする)。"""
+        with self._lock:
+            configured = bool(self._base and self._token)
+        if not configured:
+            return {"error": "未設定"}
+        try:
+            return self._request("/api/usage")
+        except urllib.error.HTTPError as e:
+            if e.code == HTTP_UNAUTHORIZED:
+                return {"error": "トークンが無効です"}
+            try:
+                return json.load(e)  # 503でも本文にエラー理由が入っている
+            except (OSError, ValueError):
+                return {"error": f"HTTP {e.code}"}
+        except (OSError, ValueError):
+            return {"error": "サーバーに接続できません"}
+
+
+HTTP_UNAUTHORIZED = 401
+USAGE_POLL_SEC = 60.0  # GUIがプラン使用量を取り直す間隔(サーバー側でも同じ間隔でキャッシュする)
+
+
+class UsageSource:
+    """プラン使用量を別スレッドで周期取得する(ネットワーク待ちでGUIを固めない)。get()は最新結果を返す。"""
+
+    def __init__(self, fetch_fn):
+        self._fetch_fn = fetch_fn
+        self._lock = threading.Lock()
+        self._usage: dict = {}
+        self._wake = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def refresh_now(self) -> None:
+        self._wake.set()
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                usage = self._fetch_fn()
+            except Exception as e:  # 取得側のどんな失敗でも周期取得を止めない
+                logging.warning("usage fetch failed: %s", e)
+                usage = {"error": "使用量を取得できません"}
+            with self._lock:
+                if "error" in usage and set(usage) == {"error"}:
+                    # 失敗しても前回値は残し、エラー表示だけ更新する
+                    self._usage = {**{k: v for k, v in self._usage.items() if k != "error"}, **usage}
+                else:
+                    self._usage = usage
+            self._wake.wait(USAGE_POLL_SEC)
+            self._wake.clear()
+
+    def get(self) -> dict:
+        with self._lock:
+            return dict(self._usage)
 
 
 def load_ui_prefs() -> dict:
@@ -839,7 +1000,9 @@ class ToggleSwitch(tk.Canvas):
 
     WIDTH, HEIGHT, KNOB = 46, 26, 20
 
-    def __init__(self, master: tk.Widget, bg: str, command):
+    def __init__(self, master: tk.Widget, bg: str, command, size: tuple[int, int, int] | None = None):
+        if size is not None:
+            self.WIDTH, self.HEIGHT, self.KNOB = size  # タイトルバー用の小型版など
         super().__init__(master, width=self.WIDTH, height=self.HEIGHT, bg=bg,
                          highlightthickness=0, cursor="hand2")
         self._command = command
@@ -878,6 +1041,101 @@ class ToggleSwitch(tk.Canvas):
         x0 = self.WIDTH - pad - self.KNOB if self._value else pad
         self.create_oval(x0, pad, x0 + self.KNOB, pad + self.KNOB,
                          fill="#ffffff" if self._value else COLOR_TEXT_DIM, outline="")
+
+
+class UsagePanel(tk.Canvas):
+    """Claude Usageアプリと同じ表: 行=CURRENT SESSION/WEEKLY LIMIT、
+    列=SESSION USED(バー+%)/ELAPSED(枠の経過率リング)/RESETS IN/RESETS AT。
+    スクロール領域の外(タイトルバー直下)に固定で置く。"""
+
+    # (キー, 通常の見出し, 幅が狭いときの見出し, 色)
+    ROWS = (("session", "CURRENT SESSION", "SESSION", USAGE_SESSION_COLOR),
+            ("weekly", "WEEKLY LIMIT", "WEEKLY", USAGE_WEEKLY_COLOR))
+
+    def __init__(self, master: tk.Widget):
+        super().__init__(master, bg=COLOR_BG, highlightthickness=0, height=USAGE_PANEL_HEIGHT)
+        self._usage: dict = {}
+        # フォントはOSで実際の字幅が違う(代替フォントだと広い)ため、列幅は実測で決める
+        self._label_font = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        self._at_font = tkfont.Font(family="Segoe UI", size=9)
+        self._label_cols = tuple(  # (通常, 狭いとき)の見出し列幅
+            max(self._label_font.measure(row[i]) for row in self.ROWS) + USAGE_COL_GAP * 2 for i in (1, 2))
+        self._at_col = max(USAGE_AT_COL_WIDTH, self._at_font.measure(USAGE_AT_SAMPLE) + USAGE_COL_GAP)
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def update_usage(self, usage: dict) -> None:
+        self._usage = usage
+        self._draw()
+
+    def _columns(self, width: int) -> dict[str, int]:
+        """各列の基準x座標(右端の列から順に右寄せで確保し、残りをバーに充てる)。
+        バーが最小幅を割るほど狭いときは短い見出しに切り替える(compact=True)。"""
+        at_right = width - ROW_PADDING_X
+        in_right = at_right - self._at_col
+        ring_center = in_right - USAGE_IN_COL_WIDTH - USAGE_RING_COL_WIDTH // 2
+        pct_right = ring_center - USAGE_RING_COL_WIDTH // 2 - USAGE_COL_GAP
+        bar_x1 = pct_right - USAGE_PCT_WIDTH
+        compact = bar_x1 - (ROW_PADDING_X + self._label_cols[0]) < USAGE_MIN_BAR_WIDTH
+        bar_x0 = ROW_PADDING_X + self._label_cols[1 if compact else 0]
+        bar_x1 = max(bar_x1, bar_x0 + 4)
+        return dict(at_right=at_right, in_right=in_right, ring=ring_center, compact=compact,
+                    bar_x0=bar_x0, bar_x1=bar_x1, pct_right=pct_right)
+
+    def _draw(self) -> None:
+        self.delete("all")
+        width = self.winfo_width()
+        if width <= 1:
+            return
+        col = self._columns(width)
+        dim, head_font = COLOR_TEXT_DIM, ("Segoe UI", 7)
+        y = USAGE_HEADER_Y
+        self.create_text((col["bar_x0"] + col["pct_right"]) // 2, y, text="USED" if col["compact"] else "SESSION USED", fill=dim, font=head_font)
+        self.create_text(col["ring"], y, text="ELAPSED", fill=dim, font=head_font)
+        self.create_text(col["in_right"] - USAGE_IN_COL_WIDTH // 2, y, text="RESETS IN", fill=dim, font=head_font)
+        self.create_text(col["at_right"] - self._at_col // 2, y, text="RESETS AT", fill=dim, font=head_font)
+        error = self._usage.get("error")
+        if error:
+            self.create_text(ROW_PADDING_X, y, text=error, fill=COLOR_ERROR, font=head_font, anchor="w")
+        now = datetime.now(timezone.utc)
+        for idx, (key, label, short_label, color) in enumerate(self.ROWS):
+            cy = USAGE_FIRST_ROW_Y + idx * USAGE_ROW_HEIGHT
+            self.create_text(ROW_PADDING_X, cy, text=short_label if col["compact"] else label, fill=COLOR_TEXT_DIM,
+                             font=self._label_font, anchor="w")
+            self._draw_row(self._usage.get(key), cy, col, color, now, key == "session")
+
+    def _draw_row(self, item, cy: int, col: dict[str, int], color: str, now: datetime,
+                  is_session: bool) -> None:
+        x0, x1 = col["bar_x0"], col["bar_x1"]
+        self.create_rectangle(x0, cy - USAGE_BAR_HALF, x1, cy + USAGE_BAR_HALF, fill=COLOR_TRACK, outline="")
+        r = USAGE_RING_RADIUS
+        rc = col["ring"]
+        self.create_oval(rc - r, cy - r, rc + r, cy + r, outline=COLOR_TRACK, width=USAGE_RING_WIDTH)
+        if not isinstance(item, dict):
+            for x in (col["pct_right"], col["in_right"], col["at_right"]):
+                self.create_text(x, cy, text="—", fill=COLOR_TEXT_DIM, font=("Segoe UI", 9), anchor="e")
+            return
+        pct = min(max(float(item.get("pct") or 0.0), 0.0), 100.0)
+        fill_x = x0 + int((x1 - x0) * pct / 100.0)
+        if fill_x > x0:
+            self.create_rectangle(x0, cy - USAGE_BAR_HALF, fill_x, cy + USAGE_BAR_HALF, fill=color, outline="")
+        self.create_text(col["pct_right"], cy, text=f"{pct:.0f}%", fill=COLOR_TEXT,
+                         font=("Segoe UI", 10, "bold"), anchor="e")
+        resets = parse_iso_utc(item.get("resets_at"))
+        if resets is None:
+            return
+        remaining = (resets - now).total_seconds()
+        window = float(item.get("window_sec") or 0)
+        if window > 0:
+            elapsed = min(max(1.0 - remaining / window, 0.0), 1.0)
+            if elapsed > 0:
+                self.create_arc(rc - r, cy - r, rc + r, cy + r, start=90, extent=-359.9 * elapsed,
+                                style="arc", outline=color, width=USAGE_RING_WIDTH)
+        self.create_text(col["in_right"], cy, text=format_remaining(remaining) if remaining > 0 else "—",
+                         fill=COLOR_TEXT, font=("Segoe UI", 9, "bold"), anchor="e")
+        local = resets.astimezone()
+        at_text = local.strftime("%H:%M") if is_session else f"{local.month}/{local.day} {local:%H:%M}"
+        self.create_text(col["at_right"], cy, text=at_text, fill=COLOR_TEXT_DIM,
+                         font=self._at_font, anchor="e")
 
 
 class SessionRow(tk.Frame):
@@ -1034,11 +1292,14 @@ class ClaudeMonitorApp:
         root.geometry(f"{self._width}x{self._height}+80+80")
         self._relayout_job: str | None = None
 
-        self._build_titlebar()
         self._kickoff_syncing = False
         self._kickoff_result: tuple[bool, bool] | None = None
-        if self._remote is not None:
-            self._build_kickoff_panel()
+        self._build_titlebar()
+        self._usage_source = UsageSource(
+            self._remote.fetch_usage if self._remote is not None else fetch_plan_usage)
+        self._usage_panel = UsagePanel(self.root)
+        self._usage_panel.pack(fill="x", pady=(4, 0))
+        tk.Frame(self.root, bg=COLOR_BORDER, height=1).pack(fill="x", padx=12)
         self._build_header()
         # 非表示トレイは下端に固定し、残りをスクロール可能な一覧領域にする
         self.tray = tk.Frame(root, bg=COLOR_BG, highlightthickness=0)
@@ -1099,7 +1360,10 @@ class ClaudeMonitorApp:
             font=("Segoe UI", 10), cursor="hand2",
         )
         refresh_btn.pack(side="right", padx=4)
-        refresh_btn.bind("<Button-1>", lambda e: self.refresh())
+        refresh_btn.bind("<Button-1>", lambda e: self._manual_refresh())
+
+        if self._remote is not None:
+            self._build_kickoff_toggle(bar)
 
         # ウィンドウドラッグ
         for widget in (bar,):
@@ -1114,21 +1378,19 @@ class ClaudeMonitorApp:
         self._prefs["topmost"] = self._topmost
         save_ui_prefs(self._prefs)
 
-    def _build_kickoff_panel(self) -> None:
-        """毎朝4時(JST)のHello送信を1行で表示する: タイトル + 前回の結果(成功/エラー) + スイッチ。"""
-        outer = tk.Frame(self.root, bg=COLOR_BG)
-        outer.pack(fill="x", padx=12, pady=(10, 2))
-        card = tk.Frame(outer, bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        card.pack(fill="x")
-        body = tk.Frame(card, bg=COLOR_BG)
-        body.pack(fill="x", padx=14, pady=8)
-        self._kickoff_switch = ToggleSwitch(body, COLOR_BG, self._on_kickoff_toggle)
-        self._kickoff_switch.pack(side="right")
-        tk.Label(body, text="毎朝4時(JST) Hello送信", bg=COLOR_BG, fg=COLOR_TEXT,
-                 font=("Segoe UI", 10, "bold")).pack(side="left")
-        self._kickoff_result_label = tk.Label(body, text="", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
-                                              font=("Segoe UI", 9, "bold"))
-        self._kickoff_result_label.pack(side="left", padx=(10, 0))
+    def _build_kickoff_toggle(self, bar: tk.Frame) -> None:
+        """毎朝4時(JST)のHello送信のスイッチをタイトルバーに置く。前回の結果は「Hello」の文字色で示す
+        (成功=緑/エラー=赤)。"""
+        self._kickoff_switch = ToggleSwitch(bar, COLOR_TITLEBAR, self._on_kickoff_toggle,
+                                            size=TITLE_SWITCH_SIZE)
+        self._kickoff_switch.pack(side="right", padx=(2, 8))
+        self._kickoff_result_label = tk.Label(bar, text="Hello", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
+                                              font=("Segoe UI", 8, "bold"))
+        self._kickoff_result_label.pack(side="right")
+
+    def _manual_refresh(self) -> None:
+        self._usage_source.refresh_now()
+        self._render(*self._current_sessions())
 
     def _on_kickoff_toggle(self) -> None:
         enabled = self._kickoff_switch.get()
@@ -1158,7 +1420,6 @@ class ClaudeMonitorApp:
         self._kickoff_switch.set_enabled(True)
         status = state.get("last_status")
         self._kickoff_result_label.config(
-            text=KICKOFF_STATUS_LABELS.get(status, status or ""),
             fg={"success": COLOR_GREEN, "error": COLOR_RED_ON}.get(status, COLOR_TEXT_DIM))
 
     def open_settings(self) -> None:
@@ -1245,12 +1506,15 @@ class ClaudeMonitorApp:
 
     # -- データ更新 -----------------------------------------------------
 
-    def refresh(self) -> None:
+    def _current_sessions(self) -> tuple[list[SessionInfo], str | None]:
         if self._remote is not None:
-            sessions, error = self._remote.get()
-        else:
-            sessions, error = get_sessions(), None
+            return self._remote.get()
+        return get_sessions(), None
+
+    def refresh(self) -> None:
+        sessions, error = self._current_sessions()
         self._update_kickoff_panel()
+        self._usage_panel.update_usage(self._usage_source.get())  # 残り時間・経過率は毎回手元で再計算
         self._render(sessions, error)
         self.root.after(POLL_INTERVAL_MS, self.refresh)
 

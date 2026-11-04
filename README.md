@@ -196,6 +196,16 @@ ssh -X <user>@<LXC IP or hostname>
 python3 claude_monitor.py
 ```
 
+### Plan usage panel
+Under the title bar (outside the scrolling session list), the GUI shows the
+same table as the "Claude Usage" widget: the 5-hour session limit and the weekly
+limit, each with % used, elapsed share of the window, time until reset and reset
+time. The values come from `GET /api/usage`, which the server fetches with
+Claude Code's own OAuth login (`~/.claude/.credentials.json`, read only —
+never refreshed by this tool), cached for 60 seconds. In local mode the GUI
+reads the credentials directly. In remote mode the "Hello every morning" switch
+sits in the title bar.
+
 ---
 
 ## Changing settings (optional)

@@ -783,6 +783,11 @@ class MonitorHandler(BaseHTTPRequestHandler):
             status = 503 if "error" in payload else 200
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send(status, body, "application/json; charset=utf-8", cors=True)
+        elif self.path == "/api/usage":
+            payload = claude_monitor.fetch_plan_usage()
+            status = 503 if set(payload) == {"error"} else 200
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8", cors=True)
         elif self.path == "/manifest.json":
             self._send(200, MANIFEST_JSON, "application/manifest+json; charset=utf-8")
         elif self.path == "/icon.svg":
