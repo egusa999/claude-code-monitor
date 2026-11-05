@@ -732,9 +732,11 @@ function renderUsage() {
       html += `<div class="ubar"></div><div class="upct">—</div><div class="uring">${ringSvg(0, color)}</div><div class="uin">—</div><div class="uat">—</div>`;
       continue;
     }
-    const pct = Math.min(Math.max(item.pct, 0), 100);
     const resets = item.resets_at ? new Date(item.resets_at) : null;
-    const valid = resets && !isNaN(resets.getTime());
+    // リセット時刻を過ぎた枠は終了済み。APIが古い値を返す間も、経過100%・古い使用率のままにせず未使用として描く
+    const expired = resets && !isNaN(resets.getTime()) && resets.getTime() <= now;
+    const pct = expired ? 0 : Math.min(Math.max(item.pct, 0), 100);
+    const valid = resets && !isNaN(resets.getTime()) && !expired;
     const remaining = valid ? (resets.getTime() - now) / 1000 : 0;
     const elapsed = valid && item.window_sec > 0 ? Math.min(Math.max(1 - remaining / item.window_sec, 0), 1) : 0;
     const at = !valid ? '—' : key === 'session'

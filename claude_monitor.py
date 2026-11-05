@@ -1110,6 +1110,12 @@ class UsagePanel(tk.Canvas):
         r = USAGE_RING_RADIUS
         rc = col["ring"]
         self.create_oval(rc - r, cy - r, rc + r, cy + r, outline=COLOR_TRACK, width=USAGE_RING_WIDTH)
+        resets = parse_iso_utc(item.get("resets_at")) if isinstance(item, dict) else None
+        # リセット時刻を過ぎた枠は終了済み(次に使うまで新しい枠は始まらない)。APIが古い値を返す間も
+        # 経過率が100%に張り付いたり古い使用率が残ったりしないよう、未使用(0%・空リング・「—」)として描く。
+        if isinstance(item, dict) and resets is not None and resets <= now:
+            item = {"pct": 0.0}
+            resets = None
         if not isinstance(item, dict):
             for x in (col["pct_right"], col["in_right"], col["at_right"]):
                 self.create_text(x, cy, text="—", fill=COLOR_TEXT_DIM, font=("Segoe UI", 9), anchor="e")
@@ -1120,8 +1126,9 @@ class UsagePanel(tk.Canvas):
             self.create_rectangle(x0, cy - USAGE_BAR_HALF, fill_x, cy + USAGE_BAR_HALF, fill=color, outline="")
         self.create_text(col["pct_right"], cy, text=f"{pct:.0f}%", fill=COLOR_TEXT,
                          font=("Segoe UI", 10, "bold"), anchor="e")
-        resets = parse_iso_utc(item.get("resets_at"))
         if resets is None:
+            for x in (col["in_right"], col["at_right"]):
+                self.create_text(x, cy, text="—", fill=COLOR_TEXT_DIM, font=("Segoe UI", 9), anchor="e")
             return
         remaining = (resets - now).total_seconds()
         window = float(item.get("window_sec") or 0)
