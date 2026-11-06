@@ -209,8 +209,10 @@ sits in the title bar.
 ### Creating and ending sessions (remote mode)
 Both use `claude-session-ctl` on the server over `ssh -o BatchMode=yes <SSH host>`
 (the helper shipped with ClaudeSessionManager; requests are passed as JSON on stdin).
-- **＋ (title bar)**: pick a folder under one of the "create-from folders" set in ⚙
-  (`;`-separated; the server only accepts its own allowed bases). The folder name
+- **＋ (title bar)**: switch between the create-from folders with the buttons at the
+  top (by default `ClaudeCode` and `RPA`, the same bases `claude-session-ctl` allows;
+  more can be added in ⚙, `;`-separated; the last one used is remembered), then pick
+  a folder. The folder name
   becomes the session name, so only folders named with ASCII letters, digits, `-`
   and `_` can be used. On success you can open it in a terminal — a new folder
   shows Claude's "trust this folder" prompt, which you answer yourself.

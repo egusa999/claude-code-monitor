@@ -82,7 +82,8 @@ SESSION_CTL_START = "start"
 SESSION_CTL_LISTDIR = "listdir"
 # セッション名はフォルダ名そのもの。claude-session-ctlと同じ規則で、満たさないフォルダからは作れない
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-DEFAULT_CREATE_BASES = "/root/onedrive/ClaudeCode"  # 作成元フォルダの既定(⚙で変更。サーバー側の許可範囲内に限る)
+# 作成元フォルダの既定(claude-session-ctlのALLOWED_BASESと同じ)。⚙の「追加の作成元」はこの後ろに足される
+DEFAULT_CREATE_BASES: tuple[str, ...] = ("/root/onedrive/ClaudeCode", "/root/onedrive/連絡用/RPA")
 CREATE_BASES_SEP = ";"
 SESSION_CTL_STOP = "stop"
 SESSION_CTL_CAPTURE = "capture"
@@ -751,6 +752,16 @@ def parse_create_bases(raw: str) -> list[str]:
     return bases
 
 
+def effective_create_bases(extra_raw: str) -> list[str]:
+    """既定の作成元 + ⚙で追加した作成元(重複なし)。"""
+    return parse_create_bases(CREATE_BASES_SEP.join((*DEFAULT_CREATE_BASES, extra_raw or "")))
+
+
+def base_labels(bases: list[str]) -> list[str]:
+    """作成元ボタンの表示名。末尾のフォルダ名(ClaudeCode / RPA)、重なるときはフルパス。"""
+    short = [posixpath.basename(b) or b for b in bases]
+    return [s if short.count(s) == 1 else b for s, b in zip(short, bases)]
+
 def call_session_ctl(ssh_host: str, cmd: str, runner=subprocess.run, **params) -> object:
     """`ssh <host> claude-session-ctl` にJSONリクエストを渡し、resultを返す。失敗はSessionCtlError。"""
     if not SSH_HOST_PATTERN.match(ssh_host or ""):
@@ -1118,12 +1129,15 @@ class SettingsDialog(tk.Toplevel):
         self._server = tk.StringVar(value=current.get("server", ""))
         self._token = tk.StringVar(value=current.get("token", ""))
         self._ssh = tk.StringVar(value=current.get("ssh_host") or DEFAULT_SSH_HOST)
-        self._bases = tk.StringVar(value=current.get("create_bases") or DEFAULT_CREATE_BASES)
+        # 既定(ClaudeCode・RPA)は常に使えるので、ここには追加分だけを表示・保存する
+        extra = [b for b in parse_create_bases(current.get("create_bases", ""))
+                 if b not in DEFAULT_CREATE_BASES]
+        self._bases = tk.StringVar(value=CREATE_BASES_SEP.join(extra))
         self._error = tk.StringVar()
 
         rows = (("サーバーURL", self._server, False), ("トークン", self._token, True),
                 ("SSH接続先(端末・作成用)", self._ssh, False),
-                (f"作成元フォルダ({CREATE_BASES_SEP}区切り)", self._bases, False))
+                (f"追加の作成元(任意・{CREATE_BASES_SEP}区切り)", self._bases, False))
         for r, (label, var, secret) in enumerate(rows):
             tk.Label(self, text=label, bg=COLOR_BG, fg=COLOR_TEXT, anchor="w",
                      font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w", padx=12, pady=(10, 0))
@@ -1167,9 +1181,10 @@ class SettingsDialog(tk.Toplevel):
         if not SSH_HOST_PATTERN.match(ssh_host):
             self._error.set("SSH接続先は root@claudecode のような形式で入力してください")
             return
-        bases = parse_create_bases(self._bases.get())
-        if not bases:
-            self._error.set("作成元フォルダは / から始まるサーバー上のパスで入力してください")
+        raw_bases = self._bases.get().strip()
+        bases = [b for b in parse_create_bases(raw_bases) if b not in DEFAULT_CREATE_BASES]
+        if raw_bases and not parse_create_bases(raw_bases):
+            self._error.set("追加の作成元は / から始まるサーバー上のパスで入力してください")
             return
         self.result = {"server": server, "token": token, "ssh_host": ssh_host,
                        "create_bases": CREATE_BASES_SEP.join(bases)}
@@ -1180,7 +1195,8 @@ class CreateSessionDialog(tk.Toplevel):
     """サーバー上のフォルダを選び、そのフォルダ名をセッション名にして新規作成するダイアログ。
     フォルダ一覧の取得はsshで行うため別スレッド。「作成」が押されたら self.result に (名前, フルパス) が入る。"""
 
-    def __init__(self, master: tk.Tk, ssh_host: str, bases: list[str], existing_names: set[str]):
+    def __init__(self, master: tk.Tk, ssh_host: str, bases: list[str], existing_names: set[str],
+                 initial_base: str = ""):
         super().__init__(master, bg=COLOR_BG)
         self.title("フォルダからセッションを作成")
         self.attributes("-topmost", True)
@@ -1191,12 +1207,21 @@ class CreateSessionDialog(tk.Toplevel):
         self._folders: list[str] = []
         self._load_seq = 0  # 作成元を素早く切り替えたとき、古い取得結果を捨てるための通し番号
 
-        tk.Label(self, text="作成元", bg=COLOR_BG, fg=COLOR_TEXT, font=("Segoe UI", 9)).grid(
-            row=0, column=0, sticky="w", padx=12, pady=(10, 0))
-        self._base = tk.StringVar(value=bases[0])
-        combo = ttk.Combobox(self, textvariable=self._base, values=bases, state="readonly", width=44)
-        combo.grid(row=0, column=1, sticky="w", padx=12, pady=(10, 0))
-        combo.bind("<<ComboboxSelected>>", lambda e: self._load())
+        self._base = tk.StringVar(value=initial_base if initial_base in bases else bases[0])
+        # 作成元はワンクリックで切り替えられるよう、ボタンを横に並べる(選択中はアクセント色)
+        switcher = tk.Frame(self, bg=COLOR_BG)
+        switcher.grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 0))
+        tk.Label(switcher, text="作成元", bg=COLOR_BG, fg=COLOR_TEXT, font=("Segoe UI", 9)).pack(
+            side="left", padx=(0, 10))
+        self._base_buttons: dict[str, tk.Label] = {}
+        for base, label in zip(bases, base_labels(bases)):
+            btn = tk.Label(switcher, text=label, bg=COLOR_ROW_BG, fg=COLOR_TEXT, font=("Segoe UI", 9, "bold"),
+                           padx=12, pady=3, cursor="hand2", highlightthickness=1,
+                           highlightbackground=COLOR_BORDER)
+            btn.pack(side="left", padx=(0, 6))
+            btn.bind("<Button-1>", lambda e, b=base: self._select_base(b))
+            self._base_buttons[base] = btn
+        self._paint_base_buttons()
 
         self._list = tk.Listbox(self, height=CREATE_LIST_HEIGHT, width=52, bg=COLOR_ROW_BG, fg=COLOR_TEXT,
                                 selectbackground=COLOR_ACCENT, highlightthickness=0, relief="flat",
@@ -1220,6 +1245,19 @@ class CreateSessionDialog(tk.Toplevel):
         self.grab_set()
         self.focus_force()
         self._load()
+
+    def _select_base(self, base: str) -> None:
+        if base == self._base.get():
+            return
+        self._base.set(base)
+        self._paint_base_buttons()
+        self._load()
+
+    def _paint_base_buttons(self) -> None:
+        for base, btn in self._base_buttons.items():
+            selected = base == self._base.get()
+            btn.config(bg=COLOR_ACCENT if selected else COLOR_ROW_BG,
+                       fg=COLOR_TEXT if selected else COLOR_TEXT_DIM)
 
     def _set_message(self, text: str, error: bool = False) -> None:
         self._message.set(text)
@@ -1780,16 +1818,19 @@ class ClaudeMonitorApp:
         """フォルダを選んで、フォルダ名をセッション名にした新しいセッションをサーバー上に作る。"""
         if self._remote is None or self._creating:
             return
-        bases = parse_create_bases(load_config().get("create_bases") or DEFAULT_CREATE_BASES)
-        if not self._ssh_host or not bases:
+        bases = effective_create_bases(load_config().get("create_bases", ""))
+        if not self._ssh_host:
             self.open_settings()
             return
         existing = {s.name for s in self._last_sessions}
-        dialog = CreateSessionDialog(self.root, self._ssh_host, bases, existing)
+        dialog = CreateSessionDialog(self.root, self._ssh_host, bases, existing,
+                                     initial_base=str(self._prefs.get("create_base") or ""))
         self.root.wait_window(dialog)
         if dialog.result is None:
             return
         name, directory = dialog.result
+        self._prefs["create_base"] = posixpath.dirname(directory)  # 次回は前回と同じ作成元を開く
+        save_ui_prefs(self._prefs)
         ssh_host = self._ssh_host
         self._set_creating(True)
         logging.info("create session: name=%s dir=%s", name, directory)
