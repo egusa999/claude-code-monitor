@@ -116,10 +116,10 @@ CHIP_LINE_HEIGHT = 22
 CHIP_GAP = 4
 CHIP_FONT = ("Segoe UI", 8)
 HEADER_HEIGHT = 28
-# コンテキスト列はステータス(ランプ)の直前に詰め、残りをセッション名の列に回す
-BAR_COL_WIDTH = 150
+# コンテキスト列はステータス(ランプ)の直前に置く(ステータス列を詰めた分をセッション名の列に回す)
+BAR_COL_WIDTH = 190
 STATUS_COL_WIDTH = 32
-BAR_TRACK_WIDTH = 40
+BAR_TRACK_WIDTH = 70
 MIN_WINDOW_WIDTH = 420
 MIN_WINDOW_HEIGHT = 200
 SCROLLBAR_WIDTH_PX = 8
@@ -1585,10 +1585,10 @@ class SessionRow(tk.Frame):
             c.create_rectangle(0, track_y0, fill_w, track_y1, fill=COLOR_ACCENT, outline="")
         label = (f"{info.context_pct:.0f}% "
                  f"({format_tokens(info.context_tokens)}/{format_tokens(info.context_limit)})")
-        c.create_text(BAR_TRACK_WIDTH + 6, mid + 7, text=label, fill=COLOR_TEXT, anchor="w",
+        c.create_text(BAR_TRACK_WIDTH + 8, mid + 7, text=label, fill=COLOR_TEXT, anchor="w",
                       font=("Segoe UI", 8))
         if info.model:
-            c.create_text(BAR_TRACK_WIDTH + 6, mid - 8, text=info.model, fill=COLOR_TEXT_DIM,
+            c.create_text(BAR_TRACK_WIDTH + 8, mid - 8, text=info.model, fill=COLOR_TEXT_DIM,
                           anchor="w", font=("Segoe UI", 7))
 
     def _draw_lamp(self) -> None:
