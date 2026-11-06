@@ -116,9 +116,10 @@ CHIP_LINE_HEIGHT = 22
 CHIP_GAP = 4
 CHIP_FONT = ("Segoe UI", 8)
 HEADER_HEIGHT = 28
-BAR_COL_WIDTH = 190
-STATUS_COL_WIDTH = 60
-BAR_TRACK_WIDTH = 70
+# コンテキスト列はステータス(ランプ)の直前に詰め、残りをセッション名の列に回す
+BAR_COL_WIDTH = 150
+STATUS_COL_WIDTH = 32
+BAR_TRACK_WIDTH = 40
 MIN_WINDOW_WIDTH = 420
 MIN_WINDOW_HEIGHT = 200
 SCROLLBAR_WIDTH_PX = 8
@@ -149,7 +150,6 @@ def name_col_width(window_width: int) -> int:
     """名前列の幅(残りをバー列とステータス列が占める)。"""
     return window_width - ROW_PADDING_X * 2 - BAR_COL_WIDTH - STATUS_COL_WIDTH
 UI_PREFS_PATH = Path.home() / ".claude_monitor" / "ui.json"  # 画面設定(最前面ピン)
-HIDDEN_PATH = Path.home() / ".claude_monitor" / "hidden.json"  # 「非表示」にしたセッションID
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
 SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
@@ -1069,22 +1069,6 @@ def save_ui_prefs(prefs: dict) -> None:
         logging.error("ui prefs save failed: %s", e)
 
 
-def load_hidden() -> set[str]:
-    try:
-        data = json.loads(HIDDEN_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return set()
-    return {x for x in data if isinstance(x, str)} if isinstance(data, list) else set()
-
-
-def save_hidden(hidden: set[str]) -> None:
-    try:
-        HIDDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        HIDDEN_PATH.write_text(json.dumps(sorted(hidden)), encoding="utf-8")
-    except OSError as e:
-        logging.error("hidden save failed: %s", e)
-
-
 def normalize_server_url(raw: str) -> str:
     """入力されたサーバーURLを整える。スキーム省略時はhttps(実運用はTLS)。不正ならValueError。"""
     url = raw.strip().rstrip("/")
@@ -1326,7 +1310,7 @@ class CreateSessionDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 
 class Chip(tk.Label):
-    """PWAの小さな枠付きボタン(UUID/非表示/端末など)。"""
+    """PWAの小さな枠付きボタン(UUID/端末/終了など)。"""
 
     def __init__(self, master: tk.Widget, text: str, command, bg: str = COLOR_TRACK):
         super().__init__(
@@ -1493,7 +1477,7 @@ class SessionRow(tk.Frame):
 
     LAMP_SIZE = 16
 
-    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_hide, on_uuid,
+    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_uuid,
                  on_end=None, is_ending=None):
         super().__init__(master, bg=bg, height=ROW_HEIGHT_COMPACT)
         self.pack_propagate(False)
@@ -1503,14 +1487,12 @@ class SessionRow(tk.Frame):
         self._attach_cmd = ""
         self._session_id = ""
         self._open_terminal_fn = open_terminal_fn
-        self._on_hide = on_hide
         self._on_uuid = on_uuid
         self._name_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
 
         self.name_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT, font=self._name_font, anchor="w")
         self.cwd_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT_DIM, font=("Segoe UI", 8), anchor="w")
         self.uuid_chip = Chip(self, "UUID", lambda: self._on_uuid(self._session_id), bg)
-        self.hide_chip = Chip(self, "非表示", lambda: self._on_hide(self._session_id), bg)
         self.term_chip = Chip(self, "端末", self._on_terminal, bg)
         # 終了(/session-end→削除)はリモートモードかつtmuxのセッションだけ
         self._on_end = on_end
@@ -1534,7 +1516,7 @@ class SessionRow(tk.Frame):
         if bg == self._bg:
             return
         self._bg = bg
-        for w in (self, self.name_label, self.cwd_label, self.uuid_chip, self.hide_chip,
+        for w in (self, self.name_label, self.cwd_label, self.uuid_chip,
                   self.term_chip, self.end_chip, self.bar_canvas, self.lamp_canvas):
             w.config(bg=bg)
 
@@ -1566,7 +1548,7 @@ class SessionRow(tk.Frame):
         name_w = self._name_font.measure(shown)
         # フォントによって行の高さが違うため、ラベル自身が要求する高さ以上を確保する(切れ防止)
         name_line = max(NAME_LINE_HEIGHT, self.name_label.winfo_reqheight())
-        chips = [self.uuid_chip, self.hide_chip]
+        chips = [self.uuid_chip]
         if info.attach_cmd:
             chips.append(self.term_chip)
         else:
@@ -1603,10 +1585,10 @@ class SessionRow(tk.Frame):
             c.create_rectangle(0, track_y0, fill_w, track_y1, fill=COLOR_ACCENT, outline="")
         label = (f"{info.context_pct:.0f}% "
                  f"({format_tokens(info.context_tokens)}/{format_tokens(info.context_limit)})")
-        c.create_text(BAR_TRACK_WIDTH + 8, mid + 7, text=label, fill=COLOR_TEXT, anchor="w",
+        c.create_text(BAR_TRACK_WIDTH + 6, mid + 7, text=label, fill=COLOR_TEXT, anchor="w",
                       font=("Segoe UI", 8))
         if info.model:
-            c.create_text(BAR_TRACK_WIDTH + 8, mid - 8, text=info.model, fill=COLOR_TEXT_DIM,
+            c.create_text(BAR_TRACK_WIDTH + 6, mid - 8, text=info.model, fill=COLOR_TEXT_DIM,
                           anchor="w", font=("Segoe UI", 7))
 
     def _draw_lamp(self) -> None:
@@ -1635,10 +1617,8 @@ class ClaudeMonitorApp:
         self._ssh_host = ssh_host
         self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
         self.rows: dict[str, SessionRow] = {}
-        self._hidden: set[str] = load_hidden()
         self._revealed: set[str] = set()
         self._last_sessions: list[SessionInfo] = []
-        self._tray_key: tuple = ()
 
         root.overrideredirect(True)
         root.configure(bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
@@ -1665,16 +1645,12 @@ class ClaudeMonitorApp:
         self._usage_panel.pack(fill="x", pady=(4, 0))
         tk.Frame(self.root, bg=COLOR_BORDER, height=1).pack(fill="x", padx=12)
         self._build_header()
-        # 非表示トレイは下端に固定し、残りをスクロール可能な一覧領域にする
-        self.tray = tk.Frame(root, bg=COLOR_BG, highlightthickness=0)
-        self.tray.pack(side="bottom", fill="x")
         self._build_scroll_area()
 
         self.empty_label = tk.Label(
             self.body, text="アクティブなセッションはありません",
             bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9),
         )
-        self.tray_inner = tk.Frame(self.tray, bg=COLOR_BG)
         self._build_resize_handles()
 
         self.refresh()
@@ -1918,48 +1894,11 @@ class ClaudeMonitorApp:
         y = self.root.winfo_y() + (event.y - self._drag_y)
         self.root.geometry(f"+{x}+{y}")
 
-    # -- 非表示・UUID表示(PWAと同じ。非表示は保存して次回起動時にも保持) ----------
-
-    def _hide_session(self, session_id: str) -> None:
-        self._hidden.add(session_id)
-        save_hidden(self._hidden)
-        self._render(self._last_sessions, self._last_error)
-
-    def _unhide_session(self, session_id: str) -> None:
-        self._hidden.discard(session_id)
-        save_hidden(self._hidden)
-        self._render(self._last_sessions, self._last_error)
-
-    def _unhide_all(self) -> None:
-        self._hidden.clear()
-        save_hidden(self._hidden)
-        self._render(self._last_sessions, self._last_error)
+    # -- UUID表示 -------------------------------------------------------
 
     def _toggle_uuid(self, session_id: str) -> None:
         self._revealed.symmetric_difference_update({session_id})
         self._render(self._last_sessions, self._last_error)
-
-    def _render_tray(self, hidden_sessions: list[SessionInfo]) -> None:
-        key = tuple(s.session_id for s in hidden_sessions)
-        if key == self._tray_key:
-            return
-        self._tray_key = key
-        self.tray_inner.pack_forget()
-        for w in self.tray_inner.winfo_children():
-            w.destroy()
-        if not hidden_sessions:
-            return
-        self.tray_inner.pack(fill="x", padx=ROW_PADDING_X, pady=(6, 8))
-        head = tk.Frame(self.tray_inner, bg=COLOR_BG)
-        head.pack(fill="x")
-        tk.Label(head, text=f"非表示中 ({len(hidden_sessions)})", bg=COLOR_BG, fg=COLOR_TEXT_DIM,
-                 font=("Segoe UI", 8)).pack(side="left")
-        Chip(head, "すべて戻す", self._unhide_all, COLOR_BG).pack(side="right")
-        chips = tk.Frame(self.tray_inner, bg=COLOR_BG)
-        chips.pack(fill="x", pady=(4, 0))
-        for s in hidden_sessions:
-            Chip(chips, f"{s.name}  ✕", lambda sid=s.session_id: self._unhide_session(sid),
-                 COLOR_TRACK).pack(side="left", padx=(0, 4), pady=2)
 
     # -- データ更新 -----------------------------------------------------
 
@@ -1977,18 +1916,15 @@ class ClaudeMonitorApp:
 
     def _render(self, sessions: list[SessionInfo], error: str | None) -> None:
         self._last_sessions, self._last_error = sessions, error
-        visible = [s for s in sessions if s.session_id not in self._hidden]
+        visible = sessions
         if error:
             empty_text, empty_fg = error, COLOR_ERROR
-        elif not sessions:
-            empty_text, empty_fg = "アクティブなセッションはありません", COLOR_TEXT_DIM
         else:
-            empty_text, empty_fg = "表示中のセッションはありません(下の「非表示中」欄から戻せます)", COLOR_TEXT_DIM
+            empty_text, empty_fg = "アクティブなセッションはありません", COLOR_TEXT_DIM
         self.empty_label.config(text=empty_text, fg=empty_fg)
-        self._render_tray([s for s in sessions if s.session_id in self._hidden])
 
         seen_ids = {s.session_id for s in visible}
-        # 消えた(または非表示にした)セッションの行を削除
+        # 消えたセッションの行を削除
         for sid in list(self.rows.keys()):
             if sid not in seen_ids:
                 self.rows.pop(sid).destroy()
@@ -2008,7 +1944,7 @@ class ClaudeMonitorApp:
             row = self.rows.get(info.session_id)
             if row is None:
                 row = SessionRow(self.body, row_bg, self._open_terminal_fn,
-                                 self._hide_session, self._toggle_uuid,
+                                 self._toggle_uuid,
                                  on_end=self.end_session if self._remote is not None else None,
                                  is_ending=lambda sid: sid in self._ending)
                 self.rows[info.session_id] = row
