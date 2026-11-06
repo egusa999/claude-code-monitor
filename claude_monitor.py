@@ -84,6 +84,24 @@ SESSION_CTL_LISTDIR = "listdir"
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 DEFAULT_CREATE_BASES = "/root/onedrive/ClaudeCode"  # 作成元フォルダの既定(⚙で変更。サーバー側の許可範囲内に限る)
 CREATE_BASES_SEP = ";"
+SESSION_CTL_STOP = "stop"
+SESSION_CTL_CAPTURE = "capture"
+SESSION_CTL_SEND_TEXT = "send_text"
+SESSION_CTL_SEND_KEY = "send_key"
+# --- 「終了」ボタン: /session-end を送り、完了(待機中が続く)を確認してからセッションを削除する ---
+SESSION_END_COMMAND = "/session-end"
+TMUX_ATTACH_PATTERN = re.compile(r"^tmux attach -t =([A-Za-z0-9_-]{1,64})$")  # 終了はtmuxのセッションだけ対象
+END_POLL_SEC = 1.0                    # 状態確認の間隔
+END_ENTER_DELAY_SEC = 0.5             # 文字列送信からEnter送信までの間隔
+END_START_TIMEOUT_SEC = 60.0          # この間に「作業中」にならなければ失敗(削除しない)
+END_ENTER_RESEND_AFTER_SEC = 8.0      # 作業中にならず入力欄にコマンドが残っていればEnterを1回だけ再送
+END_IDLE_STABLE_SEC = 10.0            # 「待機中」がこの秒数続いたら完了とみなす
+END_TOTAL_TIMEOUT_SEC = 30 * 60.0     # /session-end 全体の上限(超えたら削除しない)
+PANE_PROMPT_CHAR = "❯"
+PANE_BORDER_CHAR = "─"
+ANSI_SGR_PATTERN = re.compile(r"\x1b\[([0-9;:]*)m")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+SGR_DIM_ON, SGR_DIM_OFF, SGR_RESET_CODES = "2", "22", frozenset({"", "0"})
 BACKGROUND_POLL_MS = 100              # 別スレッドの処理結果をメインスレッドで確認する間隔
 CREATE_LIST_HEIGHT = 14               # 作成ダイアログのフォルダ一覧の行数
 # --- 画面レイアウト(PWAの見た目に合わせた寸法) ---
@@ -790,6 +808,93 @@ def run_in_background(widget: tk.Misc, work, on_done) -> None:
     widget.after(BACKGROUND_POLL_MS, poll)
 
 
+def _non_dim_text(raw: str) -> str:
+    """capture-pane -e の1行から、薄字(SGR 2)区間とエスケープを除いた表示文字列を返す。
+    入力欄の薄字はプレースホルダ・提案文で、実際の入力ではないため。"""
+    out: list[str] = []
+    dim, pos = False, 0
+    for m in ANSI_SGR_PATTERN.finditer(raw):
+        if not dim:
+            out.append(ANSI_ESCAPE_PATTERN.sub("", raw[pos:m.start()]))
+        for code in m.group(1).replace(":", ";").split(";"):
+            if code in SGR_RESET_CODES or code == SGR_DIM_OFF:
+                dim = False
+            elif code == SGR_DIM_ON:
+                dim = True
+        pos = m.end()
+    if not dim:
+        out.append(ANSI_ESCAPE_PATTERN.sub("", raw[pos:]))
+    return "".join(out)
+
+
+def pane_input_text(pane: str) -> str | None:
+    """Claude Codeの入力欄(罫線の直下の「❯ ...」行)に入っている文字列。入力欄が見つからなければNone。"""
+    lines = [ln for ln in pane.splitlines() if ANSI_ESCAPE_PATTERN.sub("", ln).strip()]
+    for i in range(len(lines) - 1, 0, -1):
+        plain = ANSI_ESCAPE_PATTERN.sub("", lines[i]).strip()
+        above = ANSI_ESCAPE_PATTERN.sub("", lines[i - 1]).strip()
+        if plain.startswith(PANE_PROMPT_CHAR) and above.startswith(PANE_BORDER_CHAR):
+            text = _non_dim_text(lines[i]).strip()
+            return text[len(PANE_PROMPT_CHAR):].strip() if text.startswith(PANE_PROMPT_CHAR) else ""
+    return None
+
+
+def end_session_workflow(name: str, session_id: str, ctl, get_session,
+                         sleep=time.sleep, clock=time.monotonic) -> None:
+    """tmuxセッション name へ /session-end を送り、完了してからセッションを削除する(claude-stop。会話履歴は残る)。
+    完了は、このモニターの「作業中」判定(トランスクリプト基準)で、作業中を一度見た後に待機中が
+    END_IDLE_STABLE_SEC 続いたことで判断する。途中で失敗・タイムアウトしたら削除はしない。
+    ctl(cmd, **params) はclaude-session-ctl呼び出し、get_session(session_id) は最新のSessionInfo(無ければNone)。"""
+    info = get_session(session_id)
+    if info is None:
+        raise SessionCtlError("セッションが一覧に見つかりません")
+    if info.working:
+        raise SessionCtlError("作業中のため送信できません。待機中(緑)になってから押してください")
+    current = pane_input_text(str(ctl(SESSION_CTL_CAPTURE, name=name)))
+    if current is None:
+        raise SessionCtlError("Claudeの入力欄が見つかりません(確認画面などが出ていないか端末で確認してください)")
+    if current:
+        raise SessionCtlError(f"入力欄に未送信の文字があります: {current!r}")
+    ctl(SESSION_CTL_SEND_TEXT, name=name, text=SESSION_END_COMMAND)
+    sleep(END_ENTER_DELAY_SEC)
+    ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
+
+    started = clock()
+    resent = False
+    while True:  # 作業中になるのを待つ(=コマンドが受け付けられた)
+        info = get_session(session_id)
+        if info is None:
+            raise SessionCtlError("セッションが途中で終了しました")
+        if info.working:
+            break
+        elapsed = clock() - started
+        if elapsed >= END_START_TIMEOUT_SEC:
+            raise SessionCtlError(f"{SESSION_END_COMMAND} が始まりませんでした(セッションは削除していません)")
+        if not resent and elapsed >= END_ENTER_RESEND_AFTER_SEC:
+            resent = True
+            if pane_input_text(str(ctl(SESSION_CTL_CAPTURE, name=name))) == SESSION_END_COMMAND:
+                logging.warning("'%s': Enter was dropped; resending", name)
+                ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
+        sleep(END_POLL_SEC)
+
+    idle_since: float | None = None
+    while True:  # 待機中が続くのを待つ(質問への回答待ちは「作業中」扱いなので、答えるまで削除しない)
+        now = clock()
+        if now - started >= END_TOTAL_TIMEOUT_SEC:
+            raise SessionCtlError(f"{SESSION_END_COMMAND} が時間内に終わりませんでした(セッションは削除していません)")
+        info = get_session(session_id)
+        if info is None:
+            raise SessionCtlError("セッションが途中で終了しました")
+        if info.working:
+            idle_since = None
+        elif idle_since is None:
+            idle_since = now
+        elif now - idle_since >= END_IDLE_STABLE_SEC:
+            break
+        sleep(END_POLL_SEC)
+    ctl(SESSION_CTL_STOP, name=name)
+
+
 class RemoteSessionSource:
     """サーバーのWeb版(`/api/sessions`)からセッション一覧を取得する。
     ネットワーク待ちでGUIを固めないよう、取得は別スレッドで周期実行し、get()は最新結果を返す。"""
@@ -1350,7 +1455,8 @@ class SessionRow(tk.Frame):
 
     LAMP_SIZE = 16
 
-    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_hide, on_uuid):
+    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_hide, on_uuid,
+                 on_end=None, is_ending=None):
         super().__init__(master, bg=bg, height=ROW_HEIGHT_COMPACT)
         self.pack_propagate(False)
         self._bg = bg
@@ -1368,6 +1474,11 @@ class SessionRow(tk.Frame):
         self.uuid_chip = Chip(self, "UUID", lambda: self._on_uuid(self._session_id), bg)
         self.hide_chip = Chip(self, "非表示", lambda: self._on_hide(self._session_id), bg)
         self.term_chip = Chip(self, "端末", self._on_terminal, bg)
+        # 終了(/session-end→削除)はリモートモードかつtmuxのセッションだけ
+        self._on_end = on_end
+        self._is_ending = is_ending or (lambda _sid: False)
+        self._info: SessionInfo | None = None
+        self.end_chip = Chip(self, "終了", lambda: self._on_end(self._info), bg)
 
         self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=36, bg=bg, highlightthickness=0)
         self.bar_canvas.place(relx=1.0, x=-(ROW_PADDING_X + STATUS_COL_WIDTH), rely=0.5, anchor="e")
@@ -1386,13 +1497,15 @@ class SessionRow(tk.Frame):
             return
         self._bg = bg
         for w in (self, self.name_label, self.cwd_label, self.uuid_chip, self.hide_chip,
-                  self.term_chip, self.bar_canvas, self.lamp_canvas):
+                  self.term_chip, self.end_chip, self.bar_canvas, self.lamp_canvas):
             w.config(bg=bg)
 
     def update_data(self, info: SessionInfo, revealed: bool, name_col: int) -> None:
         self._session_id = info.session_id
         self._attach_cmd = info.attach_cmd
         self._working = info.working
+        self._info = info
+        self.end_chip.config(text="終了中…" if self._is_ending(info.session_id) else "終了")
         self.name_label.config(text=info.name)
         self.cwd_label.config(text=info.cwd)
         self.uuid_chip.config(text=info.session_id if revealed else "UUID")
@@ -1420,6 +1533,10 @@ class SessionRow(tk.Frame):
             chips.append(self.term_chip)
         else:
             self.term_chip.place_forget()
+        if self._on_end is not None and TMUX_ATTACH_PATTERN.match(info.attach_cmd):
+            chips.append(self.end_chip)
+        else:
+            self.end_chip.place_forget()
         max_x = name_col - 4
         x, y = ROW_PADDING_X + name_w + CHIP_GAP * 2, ROW_NAME_Y
         wrapped = False
@@ -1502,6 +1619,7 @@ class ClaudeMonitorApp:
         self._kickoff_syncing = False
         self._kickoff_result: tuple[bool, bool] | None = None
         self._creating = False  # セッション作成の通信中(二重実行を防ぐ)
+        self._ending: set[str] = set()  # 「終了」処理中のsession_id(二重実行を防ぐ)
         self._build_titlebar()
         self._usage_source = UsageSource(
             self._remote.fetch_usage if self._remote is not None else fetch_plan_usage)
@@ -1680,6 +1798,45 @@ class ClaudeMonitorApp:
             lambda: call_session_ctl(ssh_host, SESSION_CTL_START, name=name, dir=directory),
             lambda _result, error: self._on_created(name, ssh_host, error))
 
+    def end_session(self, info: SessionInfo | None) -> None:
+        """「終了」: /session-end を送り、完了を確認してからセッションを削除する(会話履歴は残る)。"""
+        if self._remote is None or info is None or info.session_id in self._ending:
+            return
+        m = TMUX_ATTACH_PATTERN.match(info.attach_cmd)
+        if not m:
+            return
+        name, session_id, ssh_host = m.group(1), info.session_id, self._ssh_host
+        if info.working:
+            messagebox.showinfo("Claude Code Monitor", f"'{name}' は作業中です。待機中(緑)になってから押してください。")
+            return
+        if not messagebox.askyesno(
+                "Claude Code Monitor",
+                f"'{name}' に {SESSION_END_COMMAND} を送り、完了したらセッションを削除します。\n"
+                "(会話履歴は残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?"):
+            return
+        self._ending.add(session_id)
+        self._render(*self._current_sessions())
+        logging.info("end session: name=%s id=%s", name, session_id)
+
+        def get_session(sid: str) -> SessionInfo | None:
+            sessions, _error = self._remote.get()  # 取得失敗中は前回値(スレッドセーフ)
+            return next((s for s in sessions if s.session_id == sid), None)
+
+        run_in_background(
+            self.root,
+            lambda: end_session_workflow(
+                name, session_id, lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p), get_session),
+            lambda _result, error: self._on_ended(name, session_id, error))
+
+    def _on_ended(self, name: str, session_id: str, error: str | None) -> None:
+        self._ending.discard(session_id)
+        self._render(*self._current_sessions())
+        if error:
+            logging.error("end session failed: %s: %s", name, error)
+            messagebox.showerror("Claude Code Monitor", f"'{name}' の終了処理を中断しました。\n\n{error}")
+            return
+        logging.info("end session done: %s", name)
+
     def _set_creating(self, creating: bool) -> None:
         self._creating = creating
         self._create_btn.config(text="…" if creating else "＋",
@@ -1810,7 +1967,9 @@ class ClaudeMonitorApp:
             row = self.rows.get(info.session_id)
             if row is None:
                 row = SessionRow(self.body, row_bg, self._open_terminal_fn,
-                                 self._hide_session, self._toggle_uuid)
+                                 self._hide_session, self._toggle_uuid,
+                                 on_end=self.end_session if self._remote is not None else None,
+                                 is_ending=lambda sid: sid in self._ending)
                 self.rows[info.session_id] = row
             row.pack(fill="x")
             row.update_bg(row_bg)

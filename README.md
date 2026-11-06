@@ -206,6 +206,21 @@ never refreshed by this tool), cached for 60 seconds. In local mode the GUI
 reads the credentials directly. In remote mode the "Hello every morning" switch
 sits in the title bar.
 
+### Creating and ending sessions (remote mode)
+Both use `claude-session-ctl` on the server over `ssh -o BatchMode=yes <SSH host>`
+(the helper shipped with ClaudeSessionManager; requests are passed as JSON on stdin).
+- **＋ (title bar)**: pick a folder under one of the "create-from folders" set in ⚙
+  (`;`-separated; the server only accepts its own allowed bases). The folder name
+  becomes the session name, so only folders named with ASCII letters, digits, `-`
+  and `_` can be used. On success you can open it in a terminal — a new folder
+  shows Claude's "trust this folder" prompt, which you answer yourself.
+- **終了 (per tmux session)**: sends `/session-end`, waits until the monitor sees
+  the session working and then idle for 10 seconds, and then deletes the session
+  (`claude-stop`; the conversation history is kept). It refuses to start while the
+  session is working or its input box has text, and never deletes if
+  `/session-end` doesn't start or doesn't finish within 30 minutes. A question
+  asked during `/session-end` counts as working, so answer it in the terminal.
+
 ---
 
 ## Changing settings (optional)
