@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -73,6 +74,18 @@ SSH_HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 LOG_PATH = Path.home() / ".claude_monitor" / "app.log"  # pyw起動だとコンソールが無いため、エラーはここに残す
 # リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
 ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
+# --- フォルダからのセッション新規作成(リモートモード) ---
+# サーバー側ヘルパー(ClaudeSessionManagerと共用)。引数はJSONを標準入力で渡し、日本語パスをコマンドラインに載せない。
+SESSION_CTL_COMMAND = "claude-session-ctl"
+SESSION_CTL_TIMEOUT_SEC = 60          # 作成はclaude-startの完了待ちを含むため長めにとる
+SESSION_CTL_START = "start"
+SESSION_CTL_LISTDIR = "listdir"
+# セッション名はフォルダ名そのもの。claude-session-ctlと同じ規則で、満たさないフォルダからは作れない
+SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+DEFAULT_CREATE_BASES = "/root/onedrive/ClaudeCode"  # 作成元フォルダの既定(⚙で変更。サーバー側の許可範囲内に限る)
+CREATE_BASES_SEP = ";"
+BACKGROUND_POLL_MS = 100              # 別スレッドの処理結果をメインスレッドで確認する間隔
+CREATE_LIST_HEIGHT = 14               # 作成ダイアログのフォルダ一覧の行数
 # --- 画面レイアウト(PWAの見た目に合わせた寸法) ---
 WINDOW_WIDTH = 560
 ROW_PADDING_X = 14
@@ -706,6 +719,77 @@ def open_terminal(attach_cmd: str, ssh_host: str | None = None) -> bool:
     return False
 
 
+class SessionCtlError(Exception):
+    """claude-session-ctl呼び出しの失敗。メッセージはそのままユーザーに見せる。"""
+
+
+def parse_create_bases(raw: str) -> list[str]:
+    """「;」区切りの作成元フォルダを、絶対パスのみ・重複なしのリストにする。"""
+    bases: list[str] = []
+    for part in (raw or "").split(CREATE_BASES_SEP):
+        path = part.strip().rstrip("/") or part.strip()
+        if path.startswith("/") and path not in bases:
+            bases.append(path)
+    return bases
+
+
+def call_session_ctl(ssh_host: str, cmd: str, runner=subprocess.run, **params) -> object:
+    """`ssh <host> claude-session-ctl` にJSONリクエストを渡し、resultを返す。失敗はSessionCtlError。"""
+    if not SSH_HOST_PATTERN.match(ssh_host or ""):
+        raise SessionCtlError("SSH接続先が不正です(⚙で設定してください)")
+    payload = json.dumps({"cmd": cmd, **params}, ensure_ascii=True)
+    # pyw起動でsshのコンソール窓を出さない
+    extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    try:
+        proc = runner(["ssh", "-o", "BatchMode=yes", ssh_host, SESSION_CTL_COMMAND],
+                      input=payload, capture_output=True, text=True, encoding="utf-8",
+                      errors="replace", timeout=SESSION_CTL_TIMEOUT_SEC, **extra)
+    except subprocess.TimeoutExpired as e:
+        raise SessionCtlError(
+            f"サーバーが{SESSION_CTL_TIMEOUT_SEC}秒以内に応答しませんでした。Tailscaleの再認証が必要な場合は、"
+            f"端末で一度 ssh {ssh_host} を実行してください") from e
+    except OSError as e:
+        raise SessionCtlError(f"sshを起動できません: {e}") from e
+    try:
+        response = json.loads(proc.stdout)
+    except ValueError:
+        detail = (proc.stderr or "").strip() or f"終了コード {proc.returncode}"
+        raise SessionCtlError(f"サーバーの操作に失敗しました: {detail}") from None
+    if not isinstance(response, dict):
+        raise SessionCtlError("サーバーの応答形式が不正です")
+    if not response.get("ok"):
+        raise SessionCtlError(str(response.get("error") or "不明なエラー"))
+    return response.get("result")
+
+
+def run_in_background(widget: tk.Misc, work, on_done) -> None:
+    """work()を別スレッドで実行し、完了後にメインスレッドで on_done(result, error) を呼ぶ。
+    tkのウィジェットはメインスレッド以外から触らないため、スレッドは結果を置くだけにする。"""
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["result"] = work()
+        except SessionCtlError as e:
+            box["error"] = str(e)
+        except Exception as e:  # 想定外もログに残してダイアログで知らせる
+            logging.exception("background task failed")
+            box["error"] = f"{type(e).__name__}: {e}"
+        box["done"] = True
+
+    def poll() -> None:
+        try:
+            if not box.get("done"):
+                widget.after(BACKGROUND_POLL_MS, poll)
+                return
+            on_done(box.get("result"), box.get("error"))
+        except tk.TclError:
+            pass  # 完了前にダイアログが閉じられた
+
+    threading.Thread(target=target, daemon=True).start()
+    widget.after(BACKGROUND_POLL_MS, poll)
+
+
 class RemoteSessionSource:
     """サーバーのWeb版(`/api/sessions`)からセッション一覧を取得する。
     ネットワーク待ちでGUIを固めないよう、取得は別スレッドで周期実行し、get()は最新結果を返す。"""
@@ -902,7 +986,9 @@ def load_config() -> dict[str, str]:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return {k: str(data.get(k, "")) for k in ("server", "token", "ssh_host")}
+    if not isinstance(data, dict):
+        return {}
+    return {k: str(data.get(k, "")) for k in ("server", "token", "ssh_host", "create_bases")}
 
 
 def save_config(cfg: dict[str, str]) -> None:
@@ -927,10 +1013,12 @@ class SettingsDialog(tk.Toplevel):
         self._server = tk.StringVar(value=current.get("server", ""))
         self._token = tk.StringVar(value=current.get("token", ""))
         self._ssh = tk.StringVar(value=current.get("ssh_host") or DEFAULT_SSH_HOST)
+        self._bases = tk.StringVar(value=current.get("create_bases") or DEFAULT_CREATE_BASES)
         self._error = tk.StringVar()
 
         rows = (("サーバーURL", self._server, False), ("トークン", self._token, True),
-                ("SSH接続先(端末ボタン用)", self._ssh, False))
+                ("SSH接続先(端末・作成用)", self._ssh, False),
+                (f"作成元フォルダ({CREATE_BASES_SEP}区切り)", self._bases, False))
         for r, (label, var, secret) in enumerate(rows):
             tk.Label(self, text=label, bg=COLOR_BG, fg=COLOR_TEXT, anchor="w",
                      font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w", padx=12, pady=(10, 0))
@@ -944,11 +1032,11 @@ class SettingsDialog(tk.Toplevel):
         tk.Checkbutton(self, text="トークンを表示", variable=self._show, command=self._toggle_show,
                        bg=COLOR_BG, fg=COLOR_TEXT_DIM, selectcolor=COLOR_ROW_BG,
                        activebackground=COLOR_BG, activeforeground=COLOR_TEXT,
-                       font=("Segoe UI", 8)).grid(row=3, column=1, sticky="w", padx=12)
+                       font=("Segoe UI", 8)).grid(row=len(rows), column=1, sticky="w", padx=12)
         tk.Label(self, textvariable=self._error, bg=COLOR_BG, fg=COLOR_ERROR, anchor="w",
-                 font=("Segoe UI", 9)).grid(row=4, column=0, columnspan=2, sticky="w", padx=12)
+                 font=("Segoe UI", 9)).grid(row=len(rows) + 1, column=0, columnspan=2, sticky="w", padx=12)
         buttons = tk.Frame(self, bg=COLOR_BG)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        buttons.grid(row=len(rows) + 2, column=0, columnspan=2, sticky="e", padx=12, pady=10)
         tk.Button(buttons, text="保存", command=self._save, width=8).pack(side="right", padx=(6, 0))
         tk.Button(buttons, text="キャンセル", command=self.destroy, width=10).pack(side="right")
 
@@ -974,7 +1062,119 @@ class SettingsDialog(tk.Toplevel):
         if not SSH_HOST_PATTERN.match(ssh_host):
             self._error.set("SSH接続先は root@claudecode のような形式で入力してください")
             return
-        self.result = {"server": server, "token": token, "ssh_host": ssh_host}
+        bases = parse_create_bases(self._bases.get())
+        if not bases:
+            self._error.set("作成元フォルダは / から始まるサーバー上のパスで入力してください")
+            return
+        self.result = {"server": server, "token": token, "ssh_host": ssh_host,
+                       "create_bases": CREATE_BASES_SEP.join(bases)}
+        self.destroy()
+
+
+class CreateSessionDialog(tk.Toplevel):
+    """サーバー上のフォルダを選び、そのフォルダ名をセッション名にして新規作成するダイアログ。
+    フォルダ一覧の取得はsshで行うため別スレッド。「作成」が押されたら self.result に (名前, フルパス) が入る。"""
+
+    def __init__(self, master: tk.Tk, ssh_host: str, bases: list[str], existing_names: set[str]):
+        super().__init__(master, bg=COLOR_BG)
+        self.title("フォルダからセッションを作成")
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.result: tuple[str, str] | None = None
+        self._ssh_host = ssh_host
+        self._existing = existing_names
+        self._folders: list[str] = []
+        self._load_seq = 0  # 作成元を素早く切り替えたとき、古い取得結果を捨てるための通し番号
+
+        tk.Label(self, text="作成元", bg=COLOR_BG, fg=COLOR_TEXT, font=("Segoe UI", 9)).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 0))
+        self._base = tk.StringVar(value=bases[0])
+        combo = ttk.Combobox(self, textvariable=self._base, values=bases, state="readonly", width=44)
+        combo.grid(row=0, column=1, sticky="w", padx=12, pady=(10, 0))
+        combo.bind("<<ComboboxSelected>>", lambda e: self._load())
+
+        self._list = tk.Listbox(self, height=CREATE_LIST_HEIGHT, width=52, bg=COLOR_ROW_BG, fg=COLOR_TEXT,
+                                selectbackground=COLOR_ACCENT, highlightthickness=0, relief="flat",
+                                font=("Segoe UI", 10), activestyle="none", exportselection=False)
+        self._list.grid(row=1, column=0, columnspan=2, padx=12, pady=(8, 0))
+        self._list.bind("<<ListboxSelect>>", lambda e: self._on_select())
+        self._list.bind("<Double-Button-1>", lambda e: self._create())
+
+        self._message = tk.StringVar(value="")
+        self._message_label = tk.Label(self, textvariable=self._message, bg=COLOR_BG, fg=COLOR_TEXT_DIM,
+                                       anchor="w", justify="left", wraplength=420, font=("Segoe UI", 9))
+        self._message_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        buttons = tk.Frame(self, bg=COLOR_BG)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        self._create_btn = tk.Button(buttons, text="作成", command=self._create, width=8, state="disabled")
+        self._create_btn.pack(side="right", padx=(6, 0))
+        tk.Button(buttons, text="キャンセル", command=self.destroy, width=10).pack(side="right")
+
+        self.bind("<Return>", lambda e: self._create())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        self.focus_force()
+        self._load()
+
+    def _set_message(self, text: str, error: bool = False) -> None:
+        self._message.set(text)
+        self._message_label.config(fg=COLOR_ERROR if error else COLOR_TEXT_DIM)
+
+    def _load(self) -> None:
+        self._load_seq += 1
+        seq, base = self._load_seq, self._base.get()
+        self._list.delete(0, "end")
+        self._folders = []
+        self._create_btn.config(state="disabled")
+        self._set_message("フォルダ一覧を取得中...")
+        run_in_background(self, lambda: call_session_ctl(self._ssh_host, SESSION_CTL_LISTDIR, base=base),
+                          lambda result, error: self._on_loaded(seq, result, error))
+
+    def _on_loaded(self, seq: int, result, error: str | None) -> None:
+        if seq != self._load_seq:
+            return
+        if error:
+            self._set_message(error, error=True)
+            return
+        if not isinstance(result, list):
+            self._set_message("フォルダ一覧の形式が不正です", error=True)
+            return
+        self._folders = [f for f in result if isinstance(f, str)]
+        for i, folder in enumerate(self._folders):
+            label = folder + ("  (起動中)" if folder in self._existing else "")
+            self._list.insert("end", label)
+            if self._blocked_reason(folder):
+                self._list.itemconfig(i, fg=COLOR_TEXT_DIM)
+        self._set_message("フォルダを選ぶと、その名前のセッションを作成します" if self._folders
+                          else "フォルダがありません")
+
+    def _blocked_reason(self, folder: str) -> str | None:
+        if not SESSION_NAME_PATTERN.match(folder):
+            return "セッション名に使えるのは半角英数字・「-」「_」のみ(先頭は英数字、64文字以内)のため、このフォルダからは作成できません"
+        if folder in self._existing:
+            return f"'{folder}' という名前のセッションが既に起動しています"
+        return None
+
+    def _selected_folder(self) -> str | None:
+        sel = self._list.curselection()
+        return self._folders[sel[0]] if sel and sel[0] < len(self._folders) else None
+
+    def _on_select(self) -> None:
+        folder = self._selected_folder()
+        if folder is None:
+            return
+        reason = self._blocked_reason(folder)
+        self._create_btn.config(state="disabled" if reason else "normal")
+        if reason:
+            self._set_message(reason, error=True)
+        else:
+            self._set_message(f"セッション名: {folder}\n場所: {posixpath.join(self._base.get(), folder)}")
+
+    def _create(self) -> None:
+        folder = self._selected_folder()
+        if folder is None or self._blocked_reason(folder):
+            return
+        self.result = (folder, posixpath.join(self._base.get(), folder))  # サーバー側のパスなので常に「/」区切り
         self.destroy()
 
 
@@ -1301,6 +1501,7 @@ class ClaudeMonitorApp:
 
         self._kickoff_syncing = False
         self._kickoff_result: tuple[bool, bool] | None = None
+        self._creating = False  # セッション作成の通信中(二重実行を防ぐ)
         self._build_titlebar()
         self._usage_source = UsageSource(
             self._remote.fetch_usage if self._remote is not None else fetch_plan_usage)
@@ -1361,6 +1562,16 @@ class ClaudeMonitorApp:
             )
             settings_btn.pack(side="right", padx=4)
             settings_btn.bind("<Button-1>", lambda e: self.open_settings())
+
+            self._create_btn = tk.Label(
+                bar, text="＋", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
+                font=("Segoe UI", 10, "bold"), cursor="hand2",
+            )
+            self._create_btn.pack(side="right", padx=4)
+            self._create_btn.bind("<Button-1>", lambda e: self.open_create_dialog())
+            self._create_btn.bind("<Enter>", lambda e: self._create_btn.config(fg=COLOR_TEXT))
+            self._create_btn.bind("<Leave>", lambda e: self._create_btn.config(
+                fg=COLOR_ACCENT if self._creating else COLOR_TEXT_DIM))
 
         refresh_btn = tk.Label(
             bar, text="↻", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
@@ -1446,6 +1657,47 @@ class ClaudeMonitorApp:
                      dialog.result["server"], dialog.result["ssh_host"])
         self._ssh_host = dialog.result["ssh_host"]
         self._remote.configure(dialog.result["server"], dialog.result["token"])
+
+    def open_create_dialog(self) -> None:
+        """フォルダを選んで、フォルダ名をセッション名にした新しいセッションをサーバー上に作る。"""
+        if self._remote is None or self._creating:
+            return
+        bases = parse_create_bases(load_config().get("create_bases") or DEFAULT_CREATE_BASES)
+        if not self._ssh_host or not bases:
+            self.open_settings()
+            return
+        existing = {s.name for s in self._last_sessions}
+        dialog = CreateSessionDialog(self.root, self._ssh_host, bases, existing)
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return
+        name, directory = dialog.result
+        ssh_host = self._ssh_host
+        self._set_creating(True)
+        logging.info("create session: name=%s dir=%s", name, directory)
+        run_in_background(
+            self.root,
+            lambda: call_session_ctl(ssh_host, SESSION_CTL_START, name=name, dir=directory),
+            lambda _result, error: self._on_created(name, ssh_host, error))
+
+    def _set_creating(self, creating: bool) -> None:
+        self._creating = creating
+        self._create_btn.config(text="…" if creating else "＋",
+                                fg=COLOR_ACCENT if creating else COLOR_TEXT_DIM)
+
+    def _on_created(self, name: str, ssh_host: str, error: str | None) -> None:
+        self._set_creating(False)
+        if error:
+            logging.error("create session failed: %s", error)
+            messagebox.showerror("Claude Code Monitor", f"'{name}' を作成できませんでした。\n\n{error}")
+            return
+        # 初めてのフォルダではClaudeが信頼確認画面で止まるので、アプリでは承認せず端末で本人に答えてもらう
+        if messagebox.askyesno(
+                "Claude Code Monitor",
+                f"'{name}' を作成しました。\n端末で開きますか?\n\n"
+                "(初めてのフォルダでは、フォルダを信頼するかの確認が表示されます)"):
+            if not open_terminal(f"tmux attach -t ={name}", ssh_host):
+                messagebox.showerror("Claude Code Monitor", "端末を開けませんでした")
 
     def _build_header(self) -> None:
         header = tk.Frame(self.root, bg=COLOR_BG, height=HEADER_HEIGHT)
