@@ -120,6 +120,10 @@ HEADER_HEIGHT = 28
 BAR_COL_WIDTH = 190
 STATUS_COL_WIDTH = 32
 BAR_TRACK_WIDTH = 70
+MODEL_FONT_SIZE = 9       # コンテキスト列のモデル名
+CONTEXT_FONT_SIZE = 10    # コンテキスト列の「% (使用/上限)」
+BAR_CANVAS_HEIGHT = 46    # 上記2行が収まる高さ
+BAR_TEXT_OFFSET = 11      # 中央からモデル名・数値の行までの距離
 MIN_WINDOW_WIDTH = 420
 MIN_WINDOW_HEIGHT = 200
 SCROLLBAR_WIDTH_PX = 8
@@ -1500,7 +1504,7 @@ class SessionRow(tk.Frame):
         self._info: SessionInfo | None = None
         self.end_chip = Chip(self, "終了", lambda: self._on_end(self._info), bg)
 
-        self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=36, bg=bg, highlightthickness=0)
+        self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=BAR_CANVAS_HEIGHT, bg=bg, highlightthickness=0)
         self.bar_canvas.place(relx=1.0, x=-(ROW_PADDING_X + STATUS_COL_WIDTH), rely=0.5, anchor="e")
         self.lamp_canvas = tk.Canvas(self, width=self.LAMP_SIZE + 8, height=self.LAMP_SIZE + 8,
                                      bg=bg, highlightthickness=0)
@@ -1577,7 +1581,7 @@ class SessionRow(tk.Frame):
     def _draw_bar(self, info: SessionInfo) -> None:
         c = self.bar_canvas
         c.delete("all")
-        mid = 18
+        mid = BAR_CANVAS_HEIGHT // 2
         track_y0, track_y1 = mid - 4, mid + 4
         c.create_rectangle(0, track_y0, BAR_TRACK_WIDTH, track_y1, fill=COLOR_TRACK, outline="")
         fill_w = int(BAR_TRACK_WIDTH * min(info.context_pct, 100.0) / 100.0)
@@ -1585,11 +1589,11 @@ class SessionRow(tk.Frame):
             c.create_rectangle(0, track_y0, fill_w, track_y1, fill=COLOR_ACCENT, outline="")
         label = (f"{info.context_pct:.0f}% "
                  f"({format_tokens(info.context_tokens)}/{format_tokens(info.context_limit)})")
-        c.create_text(BAR_TRACK_WIDTH + 8, mid + 7, text=label, fill=COLOR_TEXT, anchor="w",
-                      font=("Segoe UI", 8))
+        c.create_text(BAR_TRACK_WIDTH + 8, mid + BAR_TEXT_OFFSET, text=label, fill=COLOR_TEXT, anchor="w",
+                      font=("Segoe UI", CONTEXT_FONT_SIZE))
         if info.model:
-            c.create_text(BAR_TRACK_WIDTH + 8, mid - 8, text=info.model, fill=COLOR_TEXT_DIM,
-                          anchor="w", font=("Segoe UI", 7))
+            c.create_text(BAR_TRACK_WIDTH + 8, mid - BAR_TEXT_OFFSET, text=info.model, fill=COLOR_TEXT_DIM,
+                          anchor="w", font=("Segoe UI", MODEL_FONT_SIZE))
 
     def _draw_lamp(self) -> None:
         c = self.lamp_canvas
