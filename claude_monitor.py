@@ -80,6 +80,7 @@ SESSION_CTL_COMMAND = "claude-session-ctl"
 SESSION_CTL_TIMEOUT_SEC = 60          # 作成はclaude-startの完了待ちを含むため長めにとる
 SESSION_CTL_START = "start"
 SESSION_CTL_LISTDIR = "listdir"
+SESSION_CTL_MD_STATUS = "md_status"  # 引き継ぎmd(narrative_log/rules/open_issues)の有無。1つも無ければプロジェクトフォルダではない
 # セッション名はフォルダ名そのもの。claude-session-ctlと同じ規則で、満たさないフォルダからは作れない
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # 作成元フォルダの既定(claude-session-ctlのALLOWED_BASESと同じ)。⚙の「追加の作成元」はこの後ろに足される
@@ -1194,6 +1195,7 @@ class CreateSessionDialog(tk.Toplevel):
         self._existing = existing_names
         self._folders: list[str] = []
         self._load_seq = 0  # 作成元を素早く切り替えたとき、古い取得結果を捨てるための通し番号
+        self._checking = False  # 「作成」後のmd有無確認中(二重押しを防ぐ)
 
         self._base = tk.StringVar(value=initial_base if initial_base in bases else bases[0])
         # 作成元はワンクリックで切り替えられるよう、ボタンを横に並べる(選択中はアクセント色)
@@ -1303,9 +1305,30 @@ class CreateSessionDialog(tk.Toplevel):
 
     def _create(self) -> None:
         folder = self._selected_folder()
-        if folder is None or self._blocked_reason(folder):
+        if folder is None or self._blocked_reason(folder) or self._checking:
             return
-        self.result = (folder, posixpath.join(self._base.get(), folder))  # サーバー側のパスなので常に「/」区切り
+        path = posixpath.join(self._base.get(), folder)  # サーバー側のパスなので常に「/」区切り
+        self._checking = True
+        self._create_btn.config(state="disabled")
+        self._set_message("フォルダの中身を確認中...")
+        run_in_background(self, lambda: call_session_ctl(self._ssh_host, SESSION_CTL_MD_STATUS, dir=path),
+                          lambda result, error: self._on_md_checked(folder, path, result, error))
+
+    def _on_md_checked(self, folder: str, path: str, result, error: str | None) -> None:
+        self._checking = False
+        self._on_select()  # ボタンとメッセージを選択中フォルダの状態に戻す
+        if error:
+            self._set_message(error, error=True)
+            return
+        if not (isinstance(result, dict) and any(result.values())):
+            names = "・".join(result) if isinstance(result, dict) and result else "引き継ぎ用md"
+            if not messagebox.askyesno(
+                    "プロジェクトフォルダではない可能性",
+                    f"'{folder}' には {names} が1つもありません。\n"
+                    f"プロジェクトフォルダではない可能性があります。\n\n本当にこのフォルダでセッションを作成しますか?",
+                    icon="warning", default="no", parent=self):
+                return
+        self.result = (folder, path)
         self.destroy()
 
 
@@ -1979,9 +2002,9 @@ class ClaudeMonitorApp:
         self._scroll.bind("<Configure>", self._on_scroll_area_configure)
         self.body.bind("<Configure>", lambda e: self._scroll.configure(
             scrollregion=self._scroll.bbox("all")))
-        self.root.bind_all("<MouseWheel>", self._on_wheel)
-        self.root.bind_all("<Button-4>", lambda e: self._scroll.yview_scroll(-3, "units"))
-        self.root.bind_all("<Button-5>", lambda e: self._scroll.yview_scroll(3, "units"))
+        self.root.bind_all("<MouseWheel>", lambda e: self._on_wheel(e, -1 if e.delta > 0 else 1))
+        self.root.bind_all("<Button-4>", lambda e: self._on_wheel(e, -1))
+        self.root.bind_all("<Button-5>", lambda e: self._on_wheel(e, 1))
 
     @staticmethod
     def _scrollbar_style() -> str:
@@ -2001,8 +2024,11 @@ class ClaudeMonitorApp:
                   darkcolor=[("active", COLOR_ACCENT), ("pressed", COLOR_ACCENT)])
         return SCROLLBAR_STYLE
 
-    def _on_wheel(self, event: tk.Event) -> None:
-        step = -1 if event.delta > 0 else 1
+    def _on_wheel(self, event: tk.Event, step: int) -> None:
+        # bind_allは作成ダイアログ等の別ウィンドウ上のホイールも拾うため、本体ウィンドウ上のときだけ動かす
+        widget = event.widget
+        if not isinstance(widget, tk.Misc) or widget.winfo_toplevel() is not self.root:
+            return
         self._scroll.yview_scroll(step * 3, "units")
 
     def _on_scroll_area_configure(self, event: tk.Event) -> None:
