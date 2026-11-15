@@ -475,6 +475,16 @@ def _entry_age_sec(obj: dict) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds()
 
 
+LOCAL_COMMAND_PREFIXES = ("<local-command-caveat>", "<local-command-stdout>", "<command-name>/clear")
+
+
+def _is_local_command_entry(obj: dict) -> bool:
+    """/clear 等、Claudeへ送られず応答も返らないローカルコマンドのuserエントリか。
+    これらを「考え中」と見ると、/clear後に最大AWAITING_PROMPT_MAX_AGE_SEC秒、赤のままになる。"""
+    content = (obj.get("message") or {}).get("content")
+    return isinstance(content, str) and content.lstrip().startswith(LOCAL_COMMAND_PREFIXES)
+
+
 def _is_awaiting_response(transcript: Path) -> bool:
     """トランスクリプトの最後の『メッセージ』が、まだアシスタントの応答の
     書き込みが完了していない状態(=作業中とみなすべき状態)かどうか。
@@ -506,6 +516,8 @@ def _is_awaiting_response(transcript: Path) -> bool:
         if entry_type not in ("user", "assistant"):
             continue
         if entry_type == "user":
+            if _is_local_command_entry(obj):
+                return False  # /clear等はClaudeの応答が来ない(来ないものを待たない)
             age = _entry_age_sec(obj)
             return age is not None and age < AWAITING_PROMPT_MAX_AGE_SEC
         message = obj.get("message") or {}
