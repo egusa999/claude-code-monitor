@@ -96,6 +96,7 @@ TMUX_ATTACH_PATTERN = re.compile(r"^tmux attach -t =([A-Za-z0-9_-]{1,64})$")  # 
 # --- 作成ダイアログの「作成して/project-init」: 入力欄が出る(=信頼確認に答え済み)のを待って /project-init → /clear ---
 INIT_COMMAND = "/project-init"
 CLEAR_COMMAND = "/clear"
+CLEAR_DONE_TIMEOUT_SEC = 60.0   # /clear 後にコンテキスト0を待つ上限
 SESSION_CTL_QUIET_CMDS = frozenset({"capture", "listdir"})
 SESSION_IN_USE_MARKER = "既に使われています"  # claude-session-ctl の start が同名セッションに返すエラー文の一部
 TRUST_DETECT_TIMEOUT_SEC = 20.0       # 作成直後、信頼確認の画面が出るのを待つ上限(出なければ信頼済みフォルダ)
@@ -1040,6 +1041,18 @@ def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=
     ctl(SESSION_CTL_SEND_TEXT, name=name, text=CLEAR_COMMAND)
     sleep(END_ENTER_DELAY_SEC)
     ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
+    # /clear の完了は「コンテキスト量が0になった」ことで判断する(/clearは新しい会話を作るため)
+    waited = clock()
+    while True:
+        info = find_session()
+        if info is not None and info.context_tokens == 0:
+            logging.info("'%s': %s finished (context is 0)", name, CLEAR_COMMAND)
+            return
+        if clock() - waited >= CLEAR_DONE_TIMEOUT_SEC:
+            logging.warning("'%s': context did not become 0 within %ss after %s",
+                            name, CLEAR_DONE_TIMEOUT_SEC, CLEAR_COMMAND)
+            raise SessionCtlError(f"{CLEAR_COMMAND} 後にコンテキスト量が0になりませんでした。端末で確認してください")
+        sleep(END_POLL_SEC)
 
 
 class RemoteSessionSource:
