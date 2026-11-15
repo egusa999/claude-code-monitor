@@ -96,6 +96,7 @@ TMUX_ATTACH_PATTERN = re.compile(r"^tmux attach -t =([A-Za-z0-9_-]{1,64})$")  # 
 # --- 作成ダイアログの「作成して/project-init」: 入力欄が出る(=信頼確認に答え済み)のを待って /project-init → /clear ---
 INIT_COMMAND = "/project-init"
 CLEAR_COMMAND = "/clear"
+TRUST_DETECT_TIMEOUT_SEC = 20.0       # 作成直後、信頼確認の画面が出るのを待つ上限(出なければ信頼済みフォルダ)
 INIT_READY_TIMEOUT_SEC = 10 * 60.0    # 信頼確認などに本人が答えて入力欄が出るまで待つ上限(超えたら何も送らない)
 INIT_READY_STABLE_SEC = 3.0           # 入力欄が空で待機中の状態がこの秒数続いたら送信する
 TRUST_PROMPT_MARKER = "trust"         # 画面にこれが出ている間は絶対に送らない(Enterが「Yes」を承認してしまうため)
@@ -932,6 +933,21 @@ def pane_is_ready_for_command(pane: str) -> bool:
     if TRUST_PROMPT_MARKER in ANSI_ESCAPE_PATTERN.sub("", pane).lower():
         return False
     return pane_input_text(pane) == ""
+
+
+def wait_for_trust_prompt(name: str, ctl, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """作成直後のセッションが信頼確認の画面で止まっているか。入力欄が先に見えた(信頼済み)・時間切れならFalse。
+    信頼確認に答えるまでClaudeのセッション情報が作られず、モニターの一覧に行が出ない(=行の「端末」が使えない)ため、
+    この画面が出たらアプリ側で端末を開く。"""
+    started = clock()
+    while clock() - started < TRUST_DETECT_TIMEOUT_SEC:
+        pane = str(ctl(SESSION_CTL_CAPTURE, name=name))
+        if TRUST_PROMPT_MARKER in ANSI_ESCAPE_PATTERN.sub("", pane).lower():
+            return True
+        if pane_input_text(pane) is not None:
+            return False
+        sleep(END_POLL_SEC)
+    return False
 
 
 def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=time.monotonic) -> None:
@@ -1966,7 +1982,19 @@ class ClaudeMonitorApp:
             logging.error("create session failed: %s", error)
             messagebox.showerror("Claude Code Monitor", f"'{name}' を作成できませんでした。\n\n{error}")
             return
-        # 初めてのフォルダではClaudeが信頼確認画面で止まる。アプリでは承認せず、行の「端末」ボタンから本人が答える
+        # 初めてのフォルダではClaudeが信頼確認画面で止まる(答えるまで一覧に行が出ない)。アプリでは承認せず、
+        # その画面が出ていたら端末を開いて本人に答えてもらう(ダイアログは出さない)
+        ctl = lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p)
+        run_in_background(
+            self.root,
+            lambda: wait_for_trust_prompt(name, ctl),
+            lambda trust, err: self._on_trust_checked(name, ssh_host, init_project, bool(trust) and not err))
+
+    def _on_trust_checked(self, name: str, ssh_host: str, init_project: bool, trust_pending: bool) -> None:
+        if trust_pending and not open_terminal(f"tmux attach -t ={name}", ssh_host):
+            messagebox.showerror("Claude Code Monitor",
+                                 f"'{name}' は信頼確認で止まっていますが、端末を開けませんでした。\n"
+                                 f"手元の端末で ssh -t {ssh_host} tmux attach -t ={name} を実行してください。")
         if not init_project:
             return
         marker = f"tmux attach -t ={name}"
