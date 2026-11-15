@@ -1213,10 +1213,21 @@ class CreateSessionDialog(tk.Toplevel):
             self._base_buttons[base] = btn
         self._paint_base_buttons()
 
-        self._list = tk.Listbox(self, height=CREATE_LIST_HEIGHT, width=52, bg=COLOR_ROW_BG, fg=COLOR_TEXT,
+        # フォルダ数が行数を超えても後ろの項目(アルファベット順で後ろのもの)に届くよう、スクロールバーを付ける。
+        # スタイルは本体ウィンドウ構築時に登録済みのものを使う
+        list_frame = tk.Frame(self, bg=COLOR_BG)
+        list_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(8, 0))
+        scrollbar_box = tk.Frame(list_frame, width=SCROLLBAR_WIDTH_PX, bg=COLOR_BG)
+        scrollbar_box.pack_propagate(False)
+        scrollbar = ttk.Scrollbar(scrollbar_box, orient="vertical", style=SCROLLBAR_STYLE)
+        scrollbar.pack(fill="both", expand=True)
+        self._list = tk.Listbox(list_frame, height=CREATE_LIST_HEIGHT, width=52, bg=COLOR_ROW_BG, fg=COLOR_TEXT,
                                 selectbackground=COLOR_ACCENT, highlightthickness=0, relief="flat",
-                                font=("Segoe UI", 10), activestyle="none", exportselection=False)
-        self._list.grid(row=1, column=0, columnspan=2, padx=12, pady=(8, 0))
+                                font=("Segoe UI", 10), activestyle="none", exportselection=False,
+                                yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self._list.yview)
+        scrollbar_box.pack(side="right", fill="y", padx=(4, 0))
+        self._list.pack(side="left")
         self._list.bind("<<ListboxSelect>>", lambda e: self._on_select())
         self._list.bind("<Double-Button-1>", lambda e: self._create())
 
