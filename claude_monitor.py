@@ -940,7 +940,13 @@ def run_command_workflow(name: str, command: str, session_id: str, ctl, get_sess
 def end_session_workflow(name: str, session_id: str, ctl, get_session,
                          sleep=time.sleep, clock=time.monotonic) -> None:
     """tmuxセッション name へ /session-end を送り、完了してからセッションを削除する(claude-stop。会話履歴は残る)。
-    途中で失敗・タイムアウトしたら削除はしない。"""
+    途中で失敗・タイムアウトしたら削除はしない。
+    コンテキスト量が0(会話がまだ無い)なら引き継ぎる内容が無いので、/session-end は送らず削除だけ行う。"""
+    info = get_session(session_id)
+    if info is not None and info.context_tokens == 0:
+        logging.info("'%s': context is 0; skipping %s", name, SESSION_END_COMMAND)
+        ctl(SESSION_CTL_STOP, name=name)
+        return
     try:
         run_command_workflow(name, SESSION_END_COMMAND, session_id, ctl, get_session, sleep, clock)
     except SessionCtlError as e:
