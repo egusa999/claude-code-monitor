@@ -2006,7 +2006,8 @@ class ClaudeMonitorApp:
         if info.working:
             messagebox.showinfo("Claude Code Monitor", f"'{name}' は作業中です。待機中(緑)になってから押してください。")
             return
-        if not messagebox.askyesno(
+        # コンテキスト0(会話が無い)なら/session-endを送らず削除するだけなので、確認は出さない
+        if info.context_tokens != 0 and not messagebox.askyesno(
                 "Claude Code Monitor",
                 f"'{name}' に {SESSION_END_COMMAND} を送り、完了したらセッションを削除します。\n"
                 "(会話履歴は残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?"):
