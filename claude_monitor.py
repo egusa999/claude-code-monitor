@@ -96,6 +96,8 @@ TMUX_ATTACH_PATTERN = re.compile(r"^tmux attach -t =([A-Za-z0-9_-]{1,64})$")  # 
 # --- 作成ダイアログの「作成して/project-init」: 入力欄が出る(=信頼確認に答え済み)のを待って /project-init → /clear ---
 INIT_COMMAND = "/project-init"
 CLEAR_COMMAND = "/clear"
+SESSION_CTL_QUIET_CMDS = frozenset({"capture", "listdir"})
+SESSION_IN_USE_MARKER = "既に使われています"  # claude-session-ctl の start が同名セッションに返すエラー文の一部
 TRUST_DETECT_TIMEOUT_SEC = 20.0       # 作成直後、信頼確認の画面が出るのを待つ上限(出なければ信頼済みフォルダ)
 INIT_READY_TIMEOUT_SEC = 10 * 60.0    # 信頼確認などに本人が答えて入力欄が出るまで待つ上限(超えたら何も送らない)
 INIT_READY_STABLE_SEC = 3.0           # 入力欄が空で待機中の状態がこの秒数続いたら送信する
@@ -787,6 +789,8 @@ def call_session_ctl(ssh_host: str, cmd: str, runner=subprocess.run, **params) -
     if not SSH_HOST_PATTERN.match(ssh_host or ""):
         raise SessionCtlError("SSH接続先が不正です(⚙で設定してください)")
     payload = json.dumps({"cmd": cmd, **params}, ensure_ascii=True)
+    if cmd not in SESSION_CTL_QUIET_CMDS:  # 毎秒呼ぶ取得系はログを溢れさせない
+        logging.info("ctl %s %s", cmd, {k: v for k, v in params.items() if k in ("name", "dir", "base", "key")})
     # pyw起動でsshのコンソール窓を出さない
     extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
     try:
@@ -803,10 +807,12 @@ def call_session_ctl(ssh_host: str, cmd: str, runner=subprocess.run, **params) -
         response = json.loads(proc.stdout)
     except ValueError:
         detail = (proc.stderr or "").strip() or f"終了コード {proc.returncode}"
+        logging.warning("ctl %s: unparsable response (rc=%s): %s", cmd, proc.returncode, detail[:300])
         raise SessionCtlError(f"サーバーの操作に失敗しました: {detail}") from None
     if not isinstance(response, dict):
         raise SessionCtlError("サーバーの応答形式が不正です")
     if not response.get("ok"):
+        logging.warning("ctl %s failed: %s", cmd, response.get("error"))
         raise SessionCtlError(str(response.get("error") or "不明なエラー"))
     return response.get("result")
 
@@ -886,6 +892,7 @@ def run_command_workflow(name: str, command: str, session_id: str, ctl, get_sess
         raise SessionCtlError("Claudeの入力欄が見つかりません(確認画面などが出ていないか端末で確認してください)")
     if current:
         raise SessionCtlError(f"入力欄に未送信の文字があります: {current!r}")
+    logging.info("'%s': sending %s", name, command)
     ctl(SESSION_CTL_SEND_TEXT, name=name, text=command)
     sleep(END_ENTER_DELAY_SEC)
     ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
@@ -897,9 +904,12 @@ def run_command_workflow(name: str, command: str, session_id: str, ctl, get_sess
         if info is None:
             raise SessionCtlError("セッションが途中で終了しました")
         if info.working:
+            logging.info("'%s': %s started", name, command)
             break
         elapsed = clock() - started
         if elapsed >= END_START_TIMEOUT_SEC:
+            logging.warning("'%s': %s did not start; pane: %s", name, command,
+                            pane_summary(str(ctl(SESSION_CTL_CAPTURE, name=name))))
             raise SessionCtlError(f"{command} が始まりませんでした")
         if not resent and elapsed >= END_ENTER_RESEND_AFTER_SEC:
             resent = True
@@ -912,6 +922,7 @@ def run_command_workflow(name: str, command: str, session_id: str, ctl, get_sess
     while True:  # 待機中が続くのを待つ(質問への回答待ちは「作業中」扱いなので、答えるまで完了としない)
         now = clock()
         if now - started >= END_TOTAL_TIMEOUT_SEC:
+            logging.warning("'%s': %s did not finish within %ss", name, command, END_TOTAL_TIMEOUT_SEC)
             raise SessionCtlError(f"{command} が時間内に終わりませんでした")
         info = get_session(session_id)
         if info is None:
@@ -921,6 +932,7 @@ def run_command_workflow(name: str, command: str, session_id: str, ctl, get_sess
         elif idle_since is None:
             idle_since = now
         elif now - idle_since >= END_IDLE_STABLE_SEC:
+            logging.info("'%s': %s finished", name, command)
             return
         sleep(END_POLL_SEC)
 
@@ -943,6 +955,12 @@ def pane_is_ready_for_command(pane: str) -> bool:
     return pane_input_text(pane) == ""
 
 
+def pane_summary(pane: str, limit: int = 200) -> str:
+    """ログ用に、画面の末尾(エスケープ除去・空行除去・limit文字)を1行にまとめる。"""
+    lines = [ANSI_ESCAPE_PATTERN.sub("", ln).strip() for ln in pane.splitlines()]
+    return " | ".join(ln for ln in lines if ln)[-limit:]
+
+
 def wait_for_trust_prompt(name: str, ctl, sleep=time.sleep, clock=time.monotonic) -> bool:
     """作成直後のセッションが信頼確認の画面で止まっているか。入力欄が先に見えた(信頼済み)・時間切れならFalse。
     信頼確認に答えるまでClaudeのセッション情報が作られず、モニターの一覧に行が出ない(=行の「端末」が使えない)ため、
@@ -951,10 +969,14 @@ def wait_for_trust_prompt(name: str, ctl, sleep=time.sleep, clock=time.monotonic
     while clock() - started < TRUST_DETECT_TIMEOUT_SEC:
         pane = str(ctl(SESSION_CTL_CAPTURE, name=name))
         if TRUST_PROMPT_MARKER in ANSI_ESCAPE_PATTERN.sub("", pane).lower():
+            logging.info("'%s': trust prompt detected", name)
             return True
         if pane_input_text(pane) is not None:
+            logging.info("'%s': input box visible (folder already trusted)", name)
             return False
         sleep(END_POLL_SEC)
+    logging.warning("'%s': neither trust prompt nor input box within %ss; pane: %s",
+                    name, TRUST_DETECT_TIMEOUT_SEC, pane_summary(pane))
     return False
 
 
@@ -965,15 +987,24 @@ def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=
     started = clock()
     ready_since: float | None = None
     session_id = ""
+    logging.info("'%s': waiting for the session to become ready for %s", name, INIT_COMMAND)
+    last_state = ""
     while True:
         if clock() - started >= INIT_READY_TIMEOUT_SEC:
+            logging.warning("'%s': not ready within %ss (last state: %s)", name, INIT_READY_TIMEOUT_SEC, last_state)
             raise SessionCtlError(
                 f"{INIT_COMMAND} を送れる状態になりませんでした。端末で信頼確認に答えたあと、手動で実行してください")
         info = find_session()
         ready = False
+        state = "not in monitor list yet" if info is None else "working"
         if info is not None and not info.working:
-            ready = pane_is_ready_for_command(str(ctl(SESSION_CTL_CAPTURE, name=name)))
+            pane = str(ctl(SESSION_CTL_CAPTURE, name=name))
+            ready = pane_is_ready_for_command(pane)
             session_id = info.session_id
+            state = "ready" if ready else f"not ready; pane: {pane_summary(pane)}"
+        if state.split(";")[0] != last_state.split(";")[0]:  # 状態が変わったときだけ記録
+            logging.info("'%s': %s", name, state)
+        last_state = state
         if not ready:
             ready_since = None
         elif ready_since is None:
@@ -987,6 +1018,7 @@ def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=
         return info if info is not None and info.session_id == sid else None
 
     run_command_workflow(name, INIT_COMMAND, session_id, ctl, get_session, sleep, clock)
+    logging.info("'%s': %s finished; sending %s", name, INIT_COMMAND, CLEAR_COMMAND)
     ctl(SESSION_CTL_SEND_TEXT, name=name, text=CLEAR_COMMAND)
     sleep(END_ENTER_DELAY_SEC)
     ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
@@ -1939,7 +1971,7 @@ class ClaudeMonitorApp:
         save_ui_prefs(self._prefs)
         ssh_host = self._ssh_host
         self._set_creating(True)
-        logging.info("create session: name=%s dir=%s", name, directory)
+        logging.info("create session: name=%s dir=%s init_project=%s", name, directory, init_project)
         run_in_background(
             self.root,
             lambda: call_session_ctl(ssh_host, SESSION_CTL_START, name=name, dir=directory),
@@ -1991,6 +2023,15 @@ class ClaudeMonitorApp:
 
     def _on_created(self, name: str, ssh_host: str, init_project: bool, error: str | None) -> None:
         self._set_creating(False)
+        if error and SESSION_IN_USE_MARKER in error:
+            # 信頼確認で止まったままの残骸(答えるまで一覧に行が出ず、GUIから消せない)なら、作り直さずに続きから再開する
+            logging.info("session '%s' already exists; checking whether it is waiting at the trust prompt", name)
+            ctl = lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p)
+            run_in_background(
+                self.root,
+                lambda: wait_for_trust_prompt(name, ctl),
+                lambda trust, err: self._on_resume_checked(name, ssh_host, init_project, error, bool(trust) and not err))
+            return
         if error:
             logging.error("create session failed: %s", error)
             messagebox.showerror("Claude Code Monitor", f"'{name}' を作成できませんでした。\n\n{error}")
@@ -2003,8 +2044,19 @@ class ClaudeMonitorApp:
             lambda: wait_for_trust_prompt(name, ctl),
             lambda trust, err: self._on_trust_checked(name, ssh_host, init_project, bool(trust) and not err))
 
+    def _on_resume_checked(self, name: str, ssh_host: str, init_project: bool, error: str, trust_pending: bool) -> None:
+        if not trust_pending:
+            logging.error("create session failed (name in use, not waiting at trust prompt): %s", error)
+            messagebox.showerror("Claude Code Monitor", f"'{name}' を作成できませんでした。\n\n{error}")
+            return
+        self._on_trust_checked(name, ssh_host, init_project, True)
+
     def _on_trust_checked(self, name: str, ssh_host: str, init_project: bool, trust_pending: bool) -> None:
-        if trust_pending and not open_terminal(f"tmux attach -t ={name}", ssh_host):
+        logging.info("created '%s': trust_pending=%s init_project=%s", name, trust_pending, init_project)
+        opened = trust_pending and open_terminal(f"tmux attach -t ={name}", ssh_host)
+        if trust_pending:
+            logging.info("'%s': open terminal -> %s", name, "ok" if opened else "FAILED")
+        if trust_pending and not opened:
             messagebox.showerror("Claude Code Monitor",
                                  f"'{name}' は信頼確認で止まっていますが、端末を開けませんでした。\n"
                                  f"手元の端末で ssh -t {ssh_host} tmux attach -t ={name} を実行してください。")
