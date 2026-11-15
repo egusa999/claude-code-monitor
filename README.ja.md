@@ -176,7 +176,7 @@ python3 claude_monitor.py
 ローカルモードではGUIが直接ログイン情報を読みます。リモートモードでは「毎朝Hello送信」のスイッチをタイトルバーに置きます。
 
 ### セッションの作成と終了(リモートモード)
-どちらも`ssh -o BatchMode=yes <SSH接続先>`でサーバーの`claude-session-ctl`(ClaudeSessionManager付属の
+どちらも`ssh -o BatchMode=yes <SSH接続先>`でサーバーの`claude-session-ctl`(本リポジトリのサーバー側
 ヘルパー。要求はJSONで標準入力に渡す)を使います。
 - **＋(タイトルバー)**: 上部のボタンで作成元(既定は`ClaudeCode`と`RPA`。`claude-session-ctl`が許可する
   ベースと同じ。⚙の「追加の作成元」に`;`区切りで足せる。前回使った作成元を覚える)を切り替え、その配下の

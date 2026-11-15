@@ -26,3 +26,6 @@ session_end_prompt.txt
 
 # gh認証情報の誤生成(HOME未設定時)
 .config/
+
+# サーバー側スクリプトの原本(実パス・ALLOWED_BASES等の内部情報を含むためpushしない)
+server/

@@ -208,7 +208,7 @@ sits in the title bar.
 
 ### Creating and ending sessions (remote mode)
 Both use `claude-session-ctl` on the server over `ssh -o BatchMode=yes <SSH host>`
-(the helper shipped with ClaudeSessionManager; requests are passed as JSON on stdin).
+(the server-side helper of this project; requests are passed as JSON on stdin).
 - **＋ (title bar)**: switch between the create-from folders with the buttons at the
   top (by default `ClaudeCode` and `RPA`, the same bases `claude-session-ctl` allows;
   more can be added in ⚙, `;`-separated; the last one used is remembered), then pick

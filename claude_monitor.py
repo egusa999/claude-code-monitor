@@ -75,7 +75,7 @@ LOG_PATH = Path.home() / ".claude_monitor" / "app.log"  # pyw起動だとコン�
 # リモートで実行を許す接続コマンド。サーバー応答由来の文字列をsshに渡すため、形式を厳格に限定する。
 ATTACH_CMD_PATTERN = re.compile(r"^(tmux attach -t =|claude attach )[A-Za-z0-9._-]+$")
 # --- フォルダからのセッション新規作成(リモートモード) ---
-# サーバー側ヘルパー(ClaudeSessionManagerと共用)。引数はJSONを標準入力で渡し、日本語パスをコマンドラインに載せない。
+# サーバー側ヘルパー(本プロジェクトの`server/`が原本)。引数はJSONを標準入力で渡し、日本語パスをコマンドラインに載せない。
 SESSION_CTL_COMMAND = "claude-session-ctl"
 SESSION_CTL_TIMEOUT_SEC = 60          # 作成はclaude-startの完了待ちを含むため長めにとる
 SESSION_CTL_START = "start"
