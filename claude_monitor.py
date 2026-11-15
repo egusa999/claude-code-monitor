@@ -136,6 +136,14 @@ MIN_WINDOW_WIDTH = 420
 MIN_WINDOW_HEIGHT = 200
 SCROLLBAR_WIDTH_PX = 8
 SCROLLBAR_STYLE = "Monitor.Vertical.TScrollbar"
+# アイコン(make_icon.pyで生成)。ico=Windowsのウィンドウ/タスクバー、png=iconphotoとタイトルバー
+APP_DIR = Path(__file__).resolve().parent
+ICON_ICO_PATH = APP_DIR / "claude_monitor.ico"
+ICON_WINDOW_PNG = APP_DIR / "claude_monitor_32.png"
+ICON_TITLEBAR_PNG = APP_DIR / "claude_monitor_20.png"
+APP_USER_MODEL_ID = "ClaudeCodeMonitor.GUI"  # タスクバーでpythonwとは別のアプリとして扱わせる(自前のアイコンを出す)
+GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = -20, 0x00040000, 0x00000080
+TASKBAR_REMAP_DELAY_MS = 150
 # プラン使用量パネル(Claude Usageアプリと同じ表。スクロール領域の外に固定)
 USAGE_PANEL_HEIGHT = 76
 USAGE_HEADER_Y = 10
@@ -1738,6 +1746,7 @@ class ClaudeMonitorApp:
         self._last_sessions: list[SessionInfo] = []
 
         root.overrideredirect(True)
+        self._icons = apply_app_icon(root)  # 参照を保持(消えるとアイコンが表示されない)
         root.configure(bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         self._prefs = load_ui_prefs()
         self._topmost = bool(self._prefs.get("topmost"))
@@ -1772,6 +1781,7 @@ class ClaudeMonitorApp:
 
         self.refresh()
         self._blink()
+        root.after(TASKBAR_REMAP_DELAY_MS, lambda: show_in_taskbar(root))
 
     # -- UI構築 -------------------------------------------------------
 
@@ -1780,9 +1790,12 @@ class ClaudeMonitorApp:
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
 
-        tk.Label(
-            bar, text="●", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT, font=("Segoe UI", 10, "bold"),
-        ).pack(side="left", padx=(14, 0))
+        if "titlebar" in self._icons:
+            tk.Label(bar, image=self._icons["titlebar"], bg=COLOR_TITLEBAR).pack(side="left", padx=(12, 0))
+        else:
+            tk.Label(
+                bar, text="●", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT, font=("Segoe UI", 10, "bold"),
+            ).pack(side="left", padx=(14, 0))
         tk.Label(
             bar, text="Claude Code Monitor", bg=COLOR_TITLEBAR,
             fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"),
@@ -2248,6 +2261,51 @@ def _read_token(args: argparse.Namespace) -> str:
     return os.environ.get(TOKEN_ENV_VAR, "").strip()
 
 
+def set_app_user_model_id() -> None:
+    """Windowsで、タスクバーのアイコンをpythonwではなくこのアプリのものにする(Tk生成前に呼ぶ)。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:  # noqa: BLE001 - アイコン周りの失敗でアプリを止めない
+        logging.warning("could not set AppUserModelID", exc_info=True)
+
+
+def apply_app_icon(root: tk.Tk) -> dict[str, tk.PhotoImage]:
+    """ウィンドウ(と、そこから開くダイアログ)のアイコンを設定する。戻り値のPhotoImageは参照を保持すること。
+    アイコンファイルが無い・読めないときは何もしない(アプリは動かす)。"""
+    images: dict[str, tk.PhotoImage] = {}
+    try:
+        if os.name == "nt" and ICON_ICO_PATH.is_file():
+            root.iconbitmap(default=str(ICON_ICO_PATH))
+        for key, path in (("window", ICON_WINDOW_PNG), ("titlebar", ICON_TITLEBAR_PNG)):
+            if path.is_file():
+                images[key] = tk.PhotoImage(master=root, file=str(path))
+        if "window" in images:
+            root.iconphoto(True, images["window"])
+    except tk.TclError:
+        logging.warning("could not apply app icon", exc_info=True)
+    return images
+
+
+def show_in_taskbar(root: tk.Tk) -> None:
+    """枠なし(overrideredirect)のウィンドウは既定ではタスクバーに出ないため、Windowsでだけ表示させる。
+    拡張スタイルを変えたあと、一度隠して出し直さないと反映されない。失敗しても何もしない。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
+        root.withdraw()
+        root.after(TASKBAR_REMAP_DELAY_MS, root.deiconify)
+    except Exception:  # noqa: BLE001
+        logging.warning("could not show in taskbar", exc_info=True)
+
+
 def main() -> None:
     _setup_logging()
     try:
@@ -2292,6 +2350,7 @@ def _run() -> None:
         ssh_host = args.ssh_host or cfg.get("ssh_host") or DEFAULT_SSH_HOST
         remote = RemoteSessionSource(server, token)
         logging.info("remote mode: server=%s ssh_host=%s", server or "(unset)", ssh_host)
+    set_app_user_model_id()
     root = tk.Tk()
     app = ClaudeMonitorApp(root, remote=remote, ssh_host=ssh_host)
     if remote is not None and not (server and token):
