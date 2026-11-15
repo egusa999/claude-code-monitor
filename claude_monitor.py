@@ -93,6 +93,12 @@ SESSION_CTL_SEND_KEY = "send_key"
 # --- 「終了」ボタン: /session-end を送り、完了(待機中が続く)を確認してからセッションを削除する ---
 SESSION_END_COMMAND = "/session-end"
 TMUX_ATTACH_PATTERN = re.compile(r"^tmux attach -t =([A-Za-z0-9_-]{1,64})$")  # 終了はtmuxのセッションだけ対象
+# --- 作成ダイアログの「作成して/project-init」: 入力欄が出る(=信頼確認に答え済み)のを待って /project-init → /clear ---
+INIT_COMMAND = "/project-init"
+CLEAR_COMMAND = "/clear"
+INIT_READY_TIMEOUT_SEC = 10 * 60.0    # 信頼確認などに本人が答えて入力欄が出るまで待つ上限(超えたら何も送らない)
+INIT_READY_STABLE_SEC = 3.0           # 入力欄が空で待機中の状態がこの秒数続いたら送信する
+TRUST_PROMPT_MARKER = "trust"         # 画面にこれが出ている間は絶対に送らない(Enterが「Yes」を承認してしまうため)
 END_POLL_SEC = 1.0                    # 状態確認の間隔
 END_ENTER_DELAY_SEC = 0.5             # 文字列送信からEnter送信までの間隔
 END_START_TIMEOUT_SEC = 60.0          # この間に「作業中」にならなければ失敗(削除しない)
@@ -855,11 +861,11 @@ def pane_input_text(pane: str) -> str | None:
     return None
 
 
-def end_session_workflow(name: str, session_id: str, ctl, get_session,
+def run_command_workflow(name: str, command: str, session_id: str, ctl, get_session,
                          sleep=time.sleep, clock=time.monotonic) -> None:
-    """tmuxセッション name へ /session-end を送り、完了してからセッションを削除する(claude-stop。会話履歴は残る)。
-    完了は、このモニターの「作業中」判定(トランスクリプト基準)で、作業中を一度見た後に待機中が
-    END_IDLE_STABLE_SEC 続いたことで判断する。途中で失敗・タイムアウトしたら削除はしない。
+    """tmuxセッション name へスラッシュコマンドを送り、完了(作業中を一度見た後に待機中が
+    END_IDLE_STABLE_SEC 続く)まで待つ。完了は、このモニターの「作業中」判定(トランスクリプト基準)で判断する。
+    失敗・タイムアウトは SessionCtlError(呼び出し側は完了しなかったものとして後続の操作をしない)。
     ctl(cmd, **params) はclaude-session-ctl呼び出し、get_session(session_id) は最新のSessionInfo(無ければNone)。"""
     info = get_session(session_id)
     if info is None:
@@ -871,7 +877,7 @@ def end_session_workflow(name: str, session_id: str, ctl, get_session,
         raise SessionCtlError("Claudeの入力欄が見つかりません(確認画面などが出ていないか端末で確認してください)")
     if current:
         raise SessionCtlError(f"入力欄に未送信の文字があります: {current!r}")
-    ctl(SESSION_CTL_SEND_TEXT, name=name, text=SESSION_END_COMMAND)
+    ctl(SESSION_CTL_SEND_TEXT, name=name, text=command)
     sleep(END_ENTER_DELAY_SEC)
     ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
 
@@ -885,19 +891,19 @@ def end_session_workflow(name: str, session_id: str, ctl, get_session,
             break
         elapsed = clock() - started
         if elapsed >= END_START_TIMEOUT_SEC:
-            raise SessionCtlError(f"{SESSION_END_COMMAND} が始まりませんでした(セッションは削除していません)")
+            raise SessionCtlError(f"{command} が始まりませんでした")
         if not resent and elapsed >= END_ENTER_RESEND_AFTER_SEC:
             resent = True
-            if pane_input_text(str(ctl(SESSION_CTL_CAPTURE, name=name))) == SESSION_END_COMMAND:
+            if pane_input_text(str(ctl(SESSION_CTL_CAPTURE, name=name))) == command:
                 logging.warning("'%s': Enter was dropped; resending", name)
                 ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
         sleep(END_POLL_SEC)
 
     idle_since: float | None = None
-    while True:  # 待機中が続くのを待つ(質問への回答待ちは「作業中」扱いなので、答えるまで削除しない)
+    while True:  # 待機中が続くのを待つ(質問への回答待ちは「作業中」扱いなので、答えるまで完了としない)
         now = clock()
         if now - started >= END_TOTAL_TIMEOUT_SEC:
-            raise SessionCtlError(f"{SESSION_END_COMMAND} が時間内に終わりませんでした(セッションは削除していません)")
+            raise SessionCtlError(f"{command} が時間内に終わりませんでした")
         info = get_session(session_id)
         if info is None:
             raise SessionCtlError("セッションが途中で終了しました")
@@ -906,9 +912,60 @@ def end_session_workflow(name: str, session_id: str, ctl, get_session,
         elif idle_since is None:
             idle_since = now
         elif now - idle_since >= END_IDLE_STABLE_SEC:
+            return
+        sleep(END_POLL_SEC)
+
+
+def end_session_workflow(name: str, session_id: str, ctl, get_session,
+                         sleep=time.sleep, clock=time.monotonic) -> None:
+    """tmuxセッション name へ /session-end を送り、完了してからセッションを削除する(claude-stop。会話履歴は残る)。
+    途中で失敗・タイムアウトしたら削除はしない。"""
+    try:
+        run_command_workflow(name, SESSION_END_COMMAND, session_id, ctl, get_session, sleep, clock)
+    except SessionCtlError as e:
+        raise SessionCtlError(f"{e}(セッションは削除していません)") from None
+    ctl(SESSION_CTL_STOP, name=name)
+
+
+def pane_is_ready_for_command(pane: str) -> bool:
+    """入力欄が見え、中身が空で、信頼確認などの画面ではないとき真。"""
+    if TRUST_PROMPT_MARKER in ANSI_ESCAPE_PATTERN.sub("", pane).lower():
+        return False
+    return pane_input_text(pane) == ""
+
+
+def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=time.monotonic) -> None:
+    """新規作成したセッション name で /project-init を実行し、完了してから /clear を送る。
+    本人が端末で信頼確認に答えるまで待つ(アプリは承認しない。画面にtrustが出ている間は何も送らない)。
+    /project-init が完了しなかった場合は /clear を送らない。find_session() は新セッションのSessionInfo(無ければNone)。"""
+    started = clock()
+    ready_since: float | None = None
+    session_id = ""
+    while True:
+        if clock() - started >= INIT_READY_TIMEOUT_SEC:
+            raise SessionCtlError(
+                f"{INIT_COMMAND} を送れる状態になりませんでした。端末で信頼確認に答えたあと、手動で実行してください")
+        info = find_session()
+        ready = False
+        if info is not None and not info.working:
+            ready = pane_is_ready_for_command(str(ctl(SESSION_CTL_CAPTURE, name=name)))
+            session_id = info.session_id
+        if not ready:
+            ready_since = None
+        elif ready_since is None:
+            ready_since = clock()
+        elif clock() - ready_since >= INIT_READY_STABLE_SEC:
             break
         sleep(END_POLL_SEC)
-    ctl(SESSION_CTL_STOP, name=name)
+
+    def get_session(sid: str) -> "SessionInfo | None":
+        info = find_session()
+        return info if info is not None and info.session_id == sid else None
+
+    run_command_workflow(name, INIT_COMMAND, session_id, ctl, get_session, sleep, clock)
+    ctl(SESSION_CTL_SEND_TEXT, name=name, text=CLEAR_COMMAND)
+    sleep(END_ENTER_DELAY_SEC)
+    ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
 
 
 class RemoteSessionSource:
@@ -1190,7 +1247,7 @@ class CreateSessionDialog(tk.Toplevel):
         self.title("フォルダからセッションを作成")
         self.attributes("-topmost", True)
         self.resizable(False, False)
-        self.result: tuple[str, str] | None = None
+        self.result: tuple[str, str, bool] | None = None  # (フォルダ名, パス, 作成後に/project-initを実行するか)
         self._ssh_host = ssh_host
         self._existing = existing_names
         self._folders: list[str] = []
@@ -1331,15 +1388,21 @@ class CreateSessionDialog(tk.Toplevel):
         if error:
             self._set_message(error, error=True)
             return
+        init_project = False
         if not (isinstance(result, dict) and any(result.values())):
             names = "・".join(result) if isinstance(result, dict) and result else "引き継ぎ用md"
-            if not messagebox.askyesno(
-                    "プロジェクトフォルダではない可能性",
-                    f"'{folder}' には {names} が1つもありません。\n"
-                    f"プロジェクトフォルダではない可能性があります。\n\n本当にこのフォルダでセッションを作成しますか?",
-                    icon="warning", default="no", parent=self):
+            answer = messagebox.askyesnocancel(
+                "プロジェクトフォルダではない可能性",
+                f"'{folder}' には {names} が1つもありません。\n"
+                f"プロジェクトフォルダではない可能性があります。\n\n"
+                f"はい: 作成して {INIT_COMMAND} を実行する\n"
+                f"いいえ: 作成のみ(そのまま使う)\n"
+                f"キャンセル: 作成しない",
+                icon="warning", default="cancel", parent=self)
+            if answer is None:
                 return
-        self.result = (folder, path)
+            init_project = answer
+        self.result = (folder, path, init_project)
         self.destroy()
 
 
@@ -1842,7 +1905,7 @@ class ClaudeMonitorApp:
         self.root.wait_window(dialog)
         if dialog.result is None:
             return
-        name, directory = dialog.result
+        name, directory, init_project = dialog.result
         self._prefs["create_base"] = posixpath.dirname(directory)  # 次回は前回と同じ作成元を開く
         save_ui_prefs(self._prefs)
         ssh_host = self._ssh_host
@@ -1851,7 +1914,7 @@ class ClaudeMonitorApp:
         run_in_background(
             self.root,
             lambda: call_session_ctl(ssh_host, SESSION_CTL_START, name=name, dir=directory),
-            lambda _result, error: self._on_created(name, ssh_host, error))
+            lambda _result, error: self._on_created(name, ssh_host, init_project, error))
 
     def end_session(self, info: SessionInfo | None) -> None:
         """「終了」: /session-end を送り、完了を確認してからセッションを削除する(会話履歴は残る)。"""
@@ -1897,19 +1960,33 @@ class ClaudeMonitorApp:
         self._create_btn.config(text="…" if creating else "＋",
                                 fg=COLOR_ACCENT if creating else COLOR_TEXT_DIM)
 
-    def _on_created(self, name: str, ssh_host: str, error: str | None) -> None:
+    def _on_created(self, name: str, ssh_host: str, init_project: bool, error: str | None) -> None:
         self._set_creating(False)
         if error:
             logging.error("create session failed: %s", error)
             messagebox.showerror("Claude Code Monitor", f"'{name}' を作成できませんでした。\n\n{error}")
             return
-        # 初めてのフォルダではClaudeが信頼確認画面で止まるので、アプリでは承認せず端末で本人に答えてもらう
-        if messagebox.askyesno(
-                "Claude Code Monitor",
-                f"'{name}' を作成しました。\n端末で開きますか?\n\n"
-                "(初めてのフォルダでは、フォルダを信頼するかの確認が表示されます)"):
-            if not open_terminal(f"tmux attach -t ={name}", ssh_host):
-                messagebox.showerror("Claude Code Monitor", "端末を開けませんでした")
+        # 初めてのフォルダではClaudeが信頼確認画面で止まる。アプリでは承認せず、行の「端末」ボタンから本人が答える
+        if not init_project:
+            return
+        marker = f"tmux attach -t ={name}"
+
+        def find_session() -> SessionInfo | None:
+            sessions, _error = self._remote.get()
+            return next((s for s in sessions if s.attach_cmd == marker), None)
+
+        logging.info("init project: name=%s", name)
+        run_in_background(
+            self.root,
+            lambda: init_project_workflow(name, lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p), find_session),
+            lambda _result, err: self._on_inited(name, err))
+
+    def _on_inited(self, name: str, error: str | None) -> None:
+        if error:
+            logging.error("init project failed: %s: %s", name, error)
+            messagebox.showerror("Claude Code Monitor", f"'{name}' の {INIT_COMMAND} を完了できませんでした。\n\n{error}")
+            return
+        logging.info("init project done: %s", name)
 
     def _build_header(self) -> None:
         header = tk.Frame(self.root, bg=COLOR_BG, height=HEADER_HEIGHT)
