@@ -210,11 +210,11 @@ sits in the title bar.
 Both use `claude-session-ctl` on the server over `ssh -o BatchMode=yes <SSH host>`
 (the server-side helper of this project; requests are passed as JSON on stdin).
 - **＋ (title bar)**: switch between the create-from folders with the buttons at the
-  top (by default `ClaudeCode` and `RPA`, the same bases `claude-session-ctl` allows;
-  more can be added in ⚙, `;`-separated; the last one used is remembered), then pick
-  a folder. The folder name
-  becomes the session name, so only folders named with ASCII letters, digits, `-`
-  and `_` can be used. On success you can open it in a terminal — a new folder
+  top (by default `ClaudeCode`, `RPA` and `肩評価`, the same bases `claude-session-ctl`
+  allows; more can be added in ⚙, `;`-separated; the last one used is remembered), then
+  pick a folder (the first entry, "this folder itself", is the base folder). The session
+  name is typed in a box; it defaults to the folder name when that uses only ASCII
+  letters, digits, `-` and `_` (type another name for folders with other characters). On success you can open it in a terminal — a new folder
   shows Claude's "trust this folder" prompt, which you answer yourself.
 - **終了 (per tmux session)**: sends `/session-end`, waits until the monitor sees
   the session working and then idle for 10 seconds, and then deletes the session

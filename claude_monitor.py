@@ -84,8 +84,10 @@ SESSION_CTL_MD_STATUS = "md_status"  # 引き継ぎmd(narrative_log/rules/open_i
 # セッション名はフォルダ名そのもの。claude-session-ctlと同じ規則で、満たさないフォルダからは作れない
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # 作成元フォルダの既定(claude-session-ctlのALLOWED_BASESと同じ)。⚙の「追加の作成元」はこの後ろに足される
-DEFAULT_CREATE_BASES: tuple[str, ...] = ("/root/onedrive/ClaudeCode", "/root/onedrive/連絡用/RPA")
+DEFAULT_CREATE_BASES: tuple[str, ...] = (
+    "/root/onedrive/ClaudeCode", "/root/onedrive/連絡用/RPA", "/root/onedrive/連絡用/肩評価")
 CREATE_BASES_SEP = ";"
+BASE_ITSELF = ""  # 作成ダイアログの一覧で「作成元フォルダ自体」を表す値(実フォルダ名は空にならない)
 SESSION_CTL_STOP = "stop"
 SESSION_CTL_CAPTURE = "capture"
 SESSION_CTL_SEND_TEXT = "send_text"
@@ -1325,8 +1327,11 @@ class SettingsDialog(tk.Toplevel):
 
 
 class CreateSessionDialog(tk.Toplevel):
-    """サーバー上のフォルダを選び、そのフォルダ名をセッション名にして新規作成するダイアログ。
-    フォルダ一覧の取得はsshで行うため別スレッド。「作成」が押されたら self.result に (名前, フルパス) が入る。"""
+    """サーバー上のフォルダを選び、セッションを新規作成するダイアログ。
+    一覧の先頭は作成元フォルダ自体(肩評価のように作成元そのものが作業フォルダの場合用)。
+    セッション名はフォルダ名(半角英数のときのみ)を初期値にした入力欄で、日本語名のフォルダでも別名を付ければ作れる。
+    フォルダ一覧の取得はsshで行うため別スレッド。「作成」が押されたら self.result に (名前, フルパス, init) が、
+    self.selected_base に選択中の作成元が入る。"""
 
     def __init__(self, master: tk.Tk, ssh_host: str, bases: list[str], existing_names: set[str],
                  initial_base: str = ""):
@@ -1334,7 +1339,8 @@ class CreateSessionDialog(tk.Toplevel):
         self.title("フォルダからセッションを作成")
         self.attributes("-topmost", True)
         self.resizable(False, False)
-        self.result: tuple[str, str, bool] | None = None  # (フォルダ名, パス, 作成後に/project-initを実行するか)
+        self.result: tuple[str, str, bool] | None = None  # (セッション名, パス, 作成後に/project-initを実行するか)
+        self.selected_base = ""
         self._ssh_host = ssh_host
         self._existing = existing_names
         self._folders: list[str] = []
@@ -1375,12 +1381,20 @@ class CreateSessionDialog(tk.Toplevel):
         self._list.bind("<<ListboxSelect>>", lambda e: self._on_select())
         self._list.bind("<Double-Button-1>", lambda e: self._create())
 
+        name_row = tk.Frame(self, bg=COLOR_BG)
+        name_row.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        tk.Label(name_row, text="セッション名", bg=COLOR_BG, fg=COLOR_TEXT, font=("Segoe UI", 9)).pack(
+            side="left", padx=(0, 8))
+        self._session_name = tk.StringVar(value="")
+        tk.Entry(name_row, textvariable=self._session_name, width=32, font=("Segoe UI", 10)).pack(side="left")
+        self._session_name.trace_add("write", lambda *_: self._refresh_state())
+
         self._message = tk.StringVar(value="")
         self._message_label = tk.Label(self, textvariable=self._message, bg=COLOR_BG, fg=COLOR_TEXT_DIM,
                                        anchor="w", justify="left", wraplength=420, font=("Segoe UI", 9))
-        self._message_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        self._message_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
         buttons = tk.Frame(self, bg=COLOR_BG)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", padx=12, pady=10)
         self._create_btn = tk.Button(buttons, text="作成", command=self._create, width=8, state="disabled")
         self._create_btn.pack(side="right", padx=(6, 0))
         tk.Button(buttons, text="キャンセル", command=self.destroy, width=10).pack(side="right")
@@ -1427,20 +1441,26 @@ class CreateSessionDialog(tk.Toplevel):
         if not isinstance(result, list):
             self._set_message("フォルダ一覧の形式が不正です", error=True)
             return
-        self._folders = [f for f in result if isinstance(f, str)]
-        for i, folder in enumerate(self._folders):
-            label = folder + ("  (起動中)" if folder in self._existing else "")
-            self._list.insert("end", label)
-            if self._blocked_reason(folder):
-                self._list.itemconfig(i, fg=COLOR_TEXT_DIM)
-        self._set_message("フォルダを選ぶと、その名前のセッションを作成します" if self._folders
-                          else "フォルダがありません")
+        # 先頭(BASE_ITSELF)は作成元フォルダ自体
+        self._folders = [BASE_ITSELF, *(f for f in result if isinstance(f, str) and f)]
+        base_name = posixpath.basename(self._base.get().rstrip("/"))
+        for folder in self._folders:
+            label = f"(このフォルダ自体: {base_name})" if folder == BASE_ITSELF else folder
+            self._list.insert("end", label + ("  (起動中)" if label in self._existing else ""))
+        self._set_message("フォルダを選び、セッション名を確認して「作成」を押してください")
 
-    def _blocked_reason(self, folder: str) -> str | None:
-        if not SESSION_NAME_PATTERN.match(folder):
-            return "セッション名に使えるのは半角英数字・「-」「_」のみ(先頭は英数字、64文字以内)のため、このフォルダからは作成できません"
-        if folder in self._existing:
-            return f"'{folder}' という名前のセッションが既に起動しています"
+    def _folder_path(self, folder: str) -> str:
+        base = self._base.get()
+        return base if folder == BASE_ITSELF else posixpath.join(base, folder)  # サーバー側のパスなので常に「/」区切り
+
+    def _blocked_reason(self) -> str | None:
+        name = self._session_name.get().strip()
+        if not name:
+            return "セッション名を入力してください(半角英数字・「-」「_」、先頭は英数字、64文字以内)"
+        if not SESSION_NAME_PATTERN.match(name):
+            return "セッション名に使えるのは半角英数字・「-」「_」のみです(先頭は英数字、64文字以内)"
+        if name in self._existing:
+            return f"'{name}' という名前のセッションが既に起動しています"
         return None
 
     def _selected_folder(self) -> str | None:
@@ -1448,30 +1468,39 @@ class CreateSessionDialog(tk.Toplevel):
         return self._folders[sel[0]] if sel and sel[0] < len(self._folders) else None
 
     def _on_select(self) -> None:
+        """フォルダを選び直したら、セッション名の初期値をフォルダ名にする(名前に使えない文字なら空欄にして入力を促す)。"""
         folder = self._selected_folder()
         if folder is None:
             return
-        reason = self._blocked_reason(folder)
+        default = posixpath.basename(self._folder_path(folder).rstrip("/"))
+        self._session_name.set(default if SESSION_NAME_PATTERN.match(default) else "")  # traceで_refresh_stateが走る
+
+    def _refresh_state(self) -> None:
+        folder = self._selected_folder()
+        if folder is None or self._checking:
+            return
+        reason = self._blocked_reason()
         self._create_btn.config(state="disabled" if reason else "normal")
         if reason:
             self._set_message(reason, error=True)
         else:
-            self._set_message(f"セッション名: {folder}\n場所: {posixpath.join(self._base.get(), folder)}")
+            self._set_message(f"場所: {self._folder_path(folder)}")
 
     def _create(self) -> None:
         folder = self._selected_folder()
-        if folder is None or self._blocked_reason(folder) or self._checking:
+        if folder is None or self._blocked_reason() or self._checking:
             return
-        path = posixpath.join(self._base.get(), folder)  # サーバー側のパスなので常に「/」区切り
+        path = self._folder_path(folder)
+        name = self._session_name.get().strip()
         self._checking = True
         self._create_btn.config(state="disabled")
         self._set_message("フォルダの中身を確認中...")
         run_in_background(self, lambda: call_session_ctl(self._ssh_host, SESSION_CTL_MD_STATUS, dir=path),
-                          lambda result, error: self._on_md_checked(folder, path, result, error))
+                          lambda result, error: self._on_md_checked(name, path, result, error))
 
-    def _on_md_checked(self, folder: str, path: str, result, error: str | None) -> None:
+    def _on_md_checked(self, name: str, path: str, result, error: str | None) -> None:
         self._checking = False
-        self._on_select()  # ボタンとメッセージを選択中フォルダの状態に戻す
+        self._refresh_state()  # ボタンとメッセージを選択中フォルダの状態に戻す(入力済みの名前は保つ)
         if error:
             self._set_message(error, error=True)
             return
@@ -1480,7 +1509,7 @@ class CreateSessionDialog(tk.Toplevel):
             names = "・".join(result) if isinstance(result, dict) and result else "引き継ぎ用md"
             answer = messagebox.askyesnocancel(
                 "プロジェクトフォルダではない可能性",
-                f"'{folder}' には {names} が1つもありません。\n"
+                f"'{posixpath.basename(path)}' には {names} が1つもありません。\n"
                 f"プロジェクトフォルダではない可能性があります。\n\n"
                 f"はい: 作成して {INIT_COMMAND} を実行する\n"
                 f"いいえ: 作成のみ(そのまま使う)\n"
@@ -1489,7 +1518,8 @@ class CreateSessionDialog(tk.Toplevel):
             if answer is None:
                 return
             init_project = answer
-        self.result = (folder, path, init_project)
+        self.result = (name, path, init_project)
+        self.selected_base = self._base.get()
         self.destroy()
 
 
@@ -1998,7 +2028,7 @@ class ClaudeMonitorApp:
         if dialog.result is None:
             return
         name, directory, init_project = dialog.result
-        self._prefs["create_base"] = posixpath.dirname(directory)  # 次回は前回と同じ作成元を開く
+        self._prefs["create_base"] = dialog.selected_base  # 次回は前回と同じ作成元を開く
         save_ui_prefs(self._prefs)
         ssh_host = self._ssh_host
         self._set_creating(True)
