@@ -164,7 +164,7 @@ WS_POPUP, WS_MINIMIZEBOX = 0x80000000, 0x00020000
 WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = 0x00040000, 0x00000080
 SWP_FRAMECHANGED_FLAGS = 0x0020 | 0x0001 | 0x0002 | 0x0004 | 0x0010  # FRAMECHANGED|NOSIZE|NOMOVE|NOZORDER|NOACTIVATE
 WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
-SW_MINIMIZE = 6
+WM_SYSCOMMAND, SC_MINIMIZE = 0x0112, 0xF020
 MONITOR_DEFAULTTONEAREST = 2
 WIN_STYLE_DELAY_MS = 150      # 表示されてから(ウィンドウハンドルができてから)スタイルを変える
 # スタイル変更は起動時の1回だけ。定期的に付け直す作りにしたら、Windows実機でエクスプローラーが暴走して
@@ -2724,15 +2724,26 @@ def win32_apply_style(root: tk.Tk) -> bool:
         return False
 
 
+def _post_to_window(root: tk.Tk, msg: int, wparam: int, lparam: int) -> bool:
+    """ウィンドウへメッセージを「後で処理して」と置くだけにする(PostMessage。成功したらTrue)。
+    **Tkのイベント処理の中からSendMessage等で同期的に移動ループ等を始めてはいけない**: 移動ループ中に
+    Tk・Pythonの処理が入れ子で呼ばれて固まり、マウスを握ったまま画面全体が操作不能→エクスプローラー暴走→
+    クラッシュした(2026-11-22、app.logにPythonの例外が一切残らなかった)。Postなら今の処理が終わってから、
+    標準のタイトルバーをドラッグしたときと同じ順序で動く。"""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+    return bool(user32.PostMessageW(_wrapper_hwnd(root), msg, wparam, lparam))
+
+
 def win32_start_move(root: tk.Tk) -> bool:
     """タイトルバーのドラッグをOS標準の移動として始める(FancyZones・スナップが反応する)。失敗したらFalse。"""
     try:
         import ctypes
-        user32 = ctypes.windll.user32
-        hwnd = _wrapper_hwnd(root)
-        user32.ReleaseCapture()
-        user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-        return True
+        ctypes.windll.user32.ReleaseCapture()  # Tkがボタン押下で握ったマウスを放す(放さないと移動が始まらない)
+        return _post_to_window(root, WM_NCLBUTTONDOWN, HTCAPTION, 0)
     except Exception:  # noqa: BLE001
         logging.warning("native window move failed", exc_info=True)
         return False
@@ -2740,8 +2751,7 @@ def win32_start_move(root: tk.Tk) -> bool:
 
 def win32_minimize(root: tk.Tk) -> None:
     try:
-        import ctypes
-        ctypes.windll.user32.ShowWindow(_wrapper_hwnd(root), SW_MINIMIZE)
+        _post_to_window(root, WM_SYSCOMMAND, SC_MINIMIZE, 0)  # 同期のShowWindowは使わない(上記の理由)
     except Exception:  # noqa: BLE001
         logging.warning("minimize failed", exc_info=True)
 
