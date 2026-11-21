@@ -336,6 +336,12 @@
   }
   .titlebar button:hover { color: var(--text); border-color: var(--accent); }
   .titlebar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .hello { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); cursor: default; }
+  .hello.status-success { color: var(--green); }
+  .hello.status-error { color: var(--red-on); }
+  .switch.mini { width: 30px; height: 16px; }
+  .switch.mini .slider::before { width: 12px; height: 12px; left: 2px; top: 2px; }
+  .switch.mini input:checked + .slider::before { transform: translateX(14px); }
   /* 一覧だけをスクロールさせる(タイトルバー・使用量・見出し・非表示トレイは固定) */
   .panel { display: flex; flex-direction: column; }
   .panel > * { flex-shrink: 0; }
@@ -343,6 +349,37 @@
   /* 初回にウィンドウを内容へ合わせた後(size-locked)だけ高さを画面に収め、はみ出す分を一覧内でスクロールする */
   body.size-locked { height: 100vh; height: 100dvh; }
   body.size-locked #app { min-height: 0; }
+
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 46px;
+    height: 26px;
+    flex-shrink: 0;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background: var(--track);
+    border-radius: 26px;
+    transition: background 0.2s ease;
+  }
+  .slider::before {
+    content: "";
+    position: absolute;
+    height: 20px;
+    width: 20px;
+    left: 3px;
+    top: 3px;
+    background: var(--text-dim);
+    border-radius: 50%;
+    transition: transform 0.2s ease, background 0.2s ease;
+  }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
+  .switch input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
 
   /* --- 接続先設定フォーム --- */
   .setup-panel {
@@ -417,7 +454,7 @@
     <div class="panel">
       <div class="titlebar">
         <span class="title-text"><span class="dot">&#9679;</span>Claude Code Monitor</span>
-        <span class="titlebar-actions"><button id="create-open" class="icon-btn" type="button" title="フォルダからセッションを作成">＋</button><button id="notify-toggle" class="icon-btn" type="button" title="作業完了の通知(アプリを開いている間のみ)">&#128276;</button><button id="change-address" type="button">接続先<span class="addr">: <span id="current-address"></span> (変更)</span></button></span>
+        <span class="titlebar-actions"><button id="create-open" class="icon-btn" type="button" title="フォルダからセッションを作成">＋</button><button id="notify-toggle" class="icon-btn" type="button" title="作業完了の通知(アプリを開いている間のみ)">&#128276;</button><span class="hello" id="hello" title="毎朝4時(JST) Hello送信">Hello<label class="switch mini"><input type="checkbox" id="kickoff-toggle" disabled><span class="slider"></span></label></span><button id="change-address" type="button">接続先<span class="addr">: <span id="current-address"></span> (変更)</span></button></span>
       </div>
       <div class="usage" id="usage"></div>
       <div class="jobs" id="jobs" hidden></div>
@@ -839,6 +876,58 @@ async function refreshUsage(force) {
   renderUsage();
 }
 
+const STATUS_LABELS = { success: '成功', error: 'エラー', skipped: 'スキップ' };
+const kickoffToggle = document.getElementById('kickoff-toggle');
+const helloEl = document.getElementById('hello');
+let kickoffSyncing = false;
+
+function formatLocal(iso) {
+  if (!iso) return '(まだ実行なし)';
+  return new Date(iso).toLocaleString('ja-JP');
+}
+
+function renderKickoff(state) {
+  kickoffToggle.checked = !!state.enabled;
+  kickoffToggle.disabled = false;
+  const statusLabel = state.last_status ? (STATUS_LABELS[state.last_status] || state.last_status) : '-';
+  helloEl.className = 'hello' + (state.last_status ? ` status-${state.last_status}` : '');
+  helloEl.title = `毎朝4時(JST) Hello送信: ${state.enabled ? '有効' : '無効'}\n`
+    + `次回実行(予定): ${state.next_run_local || '-'}\n前回実行: ${formatLocal(state.last_run)} ${statusLabel}`;
+  fitWindowToContent();
+}
+
+async function refreshKickoff() {
+  if (kickoffSyncing) return;
+  try {
+    const res = await apiFetch(baseUrl + '/api/kickoff', { cache: 'no-store' });
+    if (!res.ok) throw new Error('kickoff status unavailable');
+    renderKickoff(await res.json());
+  } catch (e) {
+    helloEl.className = 'hello';
+    helloEl.title = '状態を取得できません(daily_kickoff.py 未検出、またはサーバーに接続できません)';
+  }
+}
+
+kickoffToggle.addEventListener('change', async () => {
+  kickoffSyncing = true;
+  const enabled = kickoffToggle.checked;
+  kickoffToggle.disabled = true;
+  try {
+    const res = await apiFetch(baseUrl + '/api/kickoff/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) throw new Error('toggle failed');
+    renderKickoff(await res.json());
+  } catch (e) {
+    kickoffToggle.checked = !enabled;
+    kickoffToggle.disabled = false;
+  } finally {
+    kickoffSyncing = false;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 操作(＋作成・終了・信頼確認)。処理はサーバー側のジョブで動くので、アプリを閉じても止まらない。
 // 開き直すと /api/jobs から実行中・直近の操作を取り直して表示する。
@@ -1229,20 +1318,20 @@ function startApp(url) {
   lastFitHeight = 0;
   appSizeLocked = false; document.body.classList.remove('size-locked');
   lastUsage = {};
-  Promise.all([refresh(), refreshUsage(true)]).then(() => {
+  Promise.all([refresh(), refreshKickoff(), refreshUsage(true)]).then(() => {
     // 初回表示のレイアウトが確定した後にサイズを固定する
     setTimeout(() => { appSizeLocked = true; document.body.classList.add('size-locked'); }, 300);
   });
   if (pollTimer) clearInterval(pollTimer);
   jobs = []; prevWorking.clear(); idleSince.clear();
   refreshJobs();
-  pollTimer = setInterval(() => { refresh(); refreshJobs(); }, POLL_INTERVAL_MS);
+  pollTimer = setInterval(() => { refresh(); refreshKickoff(); refreshJobs(); }, POLL_INTERVAL_MS);
 }
 
 // タブ/ウィンドウが非表示の間はブラウザがsetIntervalを大幅に間引くため、
 // 表示状態に戻ったタイミングで即座に再取得して古い表示のまま放置しない。
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && baseUrl) { refresh(); refreshUsage(false); refreshJobs(); }
+  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); refreshUsage(false); refreshJobs(); }
 });
 
 // 初期化: 保存済みアドレスがあれば自動接続、なければ入力フォームを表示
