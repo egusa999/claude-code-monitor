@@ -309,6 +309,27 @@ def _is_same_process_instance(pid: int, recorded_start_ticks: int | None) -> boo
     return actual_start_ticks == recorded_start_ticks
 
 
+_DELETED_CWD_SUFFIX = " (deleted)"
+
+
+def _live_cwd(pid: int) -> str:
+    """プロセスの現在の作業フォルダを/proc/<pid>/cwdから返す。取れなければ""。
+
+    理由: sessions/<pid>.jsonのcwdは起動時の値のまま更新されないため、
+    フォルダをリネームすると一覧に旧名が出続けた(2026-11-18)。削除済み
+    フォルダ(" (deleted)"付き)や非Linux・権限なしでは""を返し、呼び出し側で
+    JSONのcwdへフォールバックさせる。"""
+    if os.name != "posix":
+        return ""
+    try:
+        target = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+    if not target or target.endswith(_DELETED_CWD_SUFFIX):
+        return ""
+    return target
+
+
 def _build_attach_cmd(data: dict) -> str:
     """セッションに端末から接続するコマンドを作る。bgは`claude attach <jobId>`
     (`claude agents`のセッションマネージャーと同じ手段)、tmux上の対話セッションは
@@ -356,7 +377,7 @@ def _load_active_sessions() -> list[SessionInfo]:
         if not session_id:
             continue
 
-        cwd = data.get("cwd", "")
+        cwd = _live_cwd(pid) or data.get("cwd", "")
         name = data.get("name") or Path(cwd).name or session_id[:8]
         started_at = (data.get("startedAt") or 0) / 1000.0
 
