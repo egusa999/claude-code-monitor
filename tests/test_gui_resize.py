@@ -211,11 +211,20 @@ class Win32ChromeTest(unittest.TestCase):
         self.app._minimize()
         self.assertEqual(self.minimized, 1)
 
-    def test_style_reapply_remaps_taskbar_at_most_limit(self):
-        self.apply_result = True
-        for _ in range(cm.TASKBAR_REMAP_MAX + 3):
+    def test_style_is_applied_only_once(self):
+        # 起動時の1回だけ。定期更新・最前面切替では付け直さない(繰り返すとエクスプローラーが暴走した)
+        self.root.after(cm.WIN_STYLE_DELAY_MS + 50, lambda: None)
+        import time
+        end = time.time() + (cm.WIN_STYLE_DELAY_MS + 300) / 1000
+        while time.time() < end:
+            self.root.update()
+        self.assertEqual(len(self.applied), 1)
+        for _ in range(5):
             self.app._ensure_win_style()
-        self.assertEqual(self.app._taskbar_remaps, cm.TASKBAR_REMAP_MAX)
+            self.app.refresh()
+        self.app._toggle_topmost()
+        self.app._toggle_topmost()
+        self.assertEqual(len(self.applied), 1)
 
     def test_native_move_skips_manual_move(self):
         ev = mock.Mock(x_root=100, y_root=100)

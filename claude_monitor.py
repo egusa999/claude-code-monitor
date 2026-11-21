@@ -153,9 +153,11 @@ APP_USER_MODEL_ID = "ClaudeCodeMonitor.GUI"  # タスクバーでpythonwとは�
 # 枠なし(overrideredirect)のウィンドウはWS_POPUP=ポップアップ扱いでFancyZonesに無視されるため、WS_POPUPだけ外す
 # (枠・タイトルバーは付かない)。移動はタイトルバーのドラッグをOS標準の移動(WM_NCLBUTTONDOWN/HTCAPTION)にして
 # FancyZonesに検知させる。サイズ変更枠(WS_THICKFRAME)+WM_NCCALCSIZEのフックは実機で太い枠が出たので使わない。
-# 予備: 環境変数 CLAUDE_MONITOR_NATIVE_FRAME=1 でWindows標準のタイトルバー(DWMでアプリの色に塗る)に戻せる。
+# ただしこのKeep風の版はWindows実機でエクスプローラーの暴走→アプリのクラッシュを起こした(2026-11-22、原因未特定)ため、
+# 既定ではWindows標準のタイトルバー(DWMでアプリの色に塗る。実機で動作確認済み)を使い、
+# Keep風は環境変数 CLAUDE_MONITOR_KEEP_STYLE=1 のときだけ有効にする(app.logで原因を調べるための試験用)。
 USE_WIN32_CHROME = os.name == "nt"
-USE_NATIVE_FRAME = USE_WIN32_CHROME and os.environ.get("CLAUDE_MONITOR_NATIVE_FRAME") == "1"
+USE_NATIVE_FRAME = USE_WIN32_CHROME and os.environ.get("CLAUDE_MONITOR_KEEP_STYLE") != "1"
 WINDOW_TITLE = "Claude Code Monitor"
 GWL_STYLE, GWL_EXSTYLE = -16, -20
 WS_POPUP, WS_MINIMIZEBOX = 0x80000000, 0x00020000
@@ -165,7 +167,8 @@ WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
 SW_MINIMIZE = 6
 MONITOR_DEFAULTTONEAREST = 2
 WIN_STYLE_DELAY_MS = 150      # 表示されてから(ウィンドウハンドルができてから)スタイルを変える
-TASKBAR_REMAP_MAX = 3         # タスクバー表示のための出し直しの上限(Tkが枠を作り直し続けても点滅させない)
+# スタイル変更は起動時の1回だけ。定期的に付け直す作りにしたら、Windows実機でエクスプローラーが暴走して
+# 画面操作ができなくなった(2026-11-22)。スタイル変更・枠の再計算・出し直しを繰り返す処理は絶対に入れないこと。
 # —□✕はWindowsのアイコン用フォント(Windows 10/11に標準搭載)
 CAPTION_GLYPH_FONT = ("Segoe MDL2 Assets", 8)
 GLYPH_MINIMIZE, GLYPH_MAXIMIZE, GLYPH_RESTORE, GLYPH_CLOSE = "\uE921", "\uE922", "\uE923", "\uE8BB"
@@ -2002,7 +2005,7 @@ class ClaudeMonitorApp:
         self._win32_chrome = win32_chrome and not native_frame
         self._maximized_from: tuple[int, int, int, int] | None = None  # 最大化前の(幅,高さ,x,y)
         self._native_move = False
-        self._taskbar_remaps = 0
+        self._win_style_done = False
         self._remote = remote
         self._ssh_host = ssh_host
         self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
@@ -2174,12 +2177,12 @@ class ClaudeMonitorApp:
                 text=GLYPH_RESTORE if self._maximized_from is not None else GLYPH_MAXIMIZE)
 
     def _ensure_win_style(self) -> None:
-        """FancyZones対応のスタイルになっているか確かめ、外れていれば付け直す(Tkが枠を作り直すと戻るため、
-        定期的に呼ぶ)。拡張スタイル(タスクバー表示)は一度隠して出し直さないと反映されない。"""
-        if not self._win32_chrome:
+        """FancyZones対応のスタイルを起動時に1回だけ付ける(以後は何もしない。繰り返すとエクスプローラーが暴走した)。
+        拡張スタイル(タスクバー表示)は一度隠して出し直さないと反映されない。"""
+        if not self._win32_chrome or self._win_style_done:
             return
-        if win32_apply_style(self.root) and self._taskbar_remaps < TASKBAR_REMAP_MAX:
-            self._taskbar_remaps += 1
+        self._win_style_done = True
+        if win32_apply_style(self.root):
             self.root.withdraw()
             self.root.after(WIN_STYLE_DELAY_MS, self.root.deiconify)
 
@@ -2187,7 +2190,6 @@ class ClaudeMonitorApp:
         """最前面固定のオン/オフ。枠なしウィンドウはタスクバーに出ないため、切り替え手段を残す。"""
         self._topmost = not self._topmost
         self.root.attributes("-topmost", self._topmost)
-        self._ensure_win_style()
         self._pin_btn.config(fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM)
         self._prefs["topmost"] = self._topmost
         save_ui_prefs(self._prefs)
@@ -2428,7 +2430,6 @@ class ClaudeMonitorApp:
         self._update_kickoff_panel()
         self._usage_panel.update_usage(self._usage_source.get())  # 残り時間・経過率は毎回手元で再計算
         self._render(sessions, error)
-        self._ensure_win_style()
         self.root.after(POLL_INTERVAL_MS, self.refresh)
 
     def _render(self, sessions: list[SessionInfo], error: str | None) -> None:
