@@ -150,6 +150,11 @@ ICON_WINDOW_PNG = APP_DIR / "claude_monitor_32.png"
 ICON_TITLEBAR_PNG = APP_DIR / "claude_monitor_20.png"
 APP_USER_MODEL_ID = "ClaudeCodeMonitor.GUI"  # タスクバーでpythonwとは別のアプリとして扱わせる(自前のアイコンを出す)
 GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = -20, 0x00040000, 0x00000080
+# FancyZonesはWindows標準の移動(タイトルバーのドラッグ)を検知してゾーンを出すため、自前のドラッグではなく
+# WM_NCLBUTTONDOWN(HTCAPTION)で標準の移動を始める。サイズ変更枠(WS_THICKFRAME)は実機で太い枠が出たので付けない
+# (2026-11-22)。そのため枠なしウィンドウはFancyZonesでは「ポップアップ」扱いになり、
+# FancyZonesの設定「ポップアップウィンドウのスナップを許可」をオンにする必要がある。
+WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
 TASKBAR_REMAP_DELAY_MS = 150
 # プラン使用量パネル(Claude Usageアプリと同じ表。スクロール領域の外に固定)
 USAGE_PANEL_HEIGHT = 76
@@ -182,6 +187,7 @@ AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスク
 SUBAGENTS_DIRNAME = "subagents"     # ~/.claude/projects/*/<sessionId>/subagents/agent-<id>.jsonl
 AGENT_FILE_GLOB = "agent-*.jsonl"
 RELAYOUT_DELAY_MS = 80              # リサイズ中の再配置の間引き間隔
+REQUESTED_SIZES_KEPT = 8            # 自分で指定したサイズを何件覚えておくか(外部リサイズの判定用)
 CORNER_CURSOR = "size_nw_se" if os.name == "nt" else "bottom_right_corner"  # Tkのカーソル名はOSで異なる
 RESIZE_GRIP_PX = 14                 # 右下のリサイズ角の大きさ
 BLINK_INTERVAL_MS = 500             # 赤ランプの点滅間隔
@@ -1951,8 +1957,11 @@ class ClaudeMonitorApp:
         # 一度でも手動でリサイズした(高さが保存されている)ら、以後は高さを自動調整しない
         self._user_sized = saved_height >= MIN_WINDOW_HEIGHT
         self._height = saved_height if self._user_sized else 60
-        root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-        root.geometry(f"{self._width}x{self._height}+80+80")
+        # root.minsize()は付けない(FancyZonesのゾーンが最小値より小さいと収まらなくなるため。
+        # 自前のリサイズハンドルは_on_resizeで最小値を守る)
+        self._requested_sizes: list[tuple[int, int]] = []  # 自分で指定した直近のサイズ(外部からの変更と区別する)
+        self._set_size(self._width, self._height, "+80+80")
+        root.bind("<Configure>", self._on_root_configure, add="+")
         self._relayout_job: str | None = None
 
         self._kickoff_syncing = False
@@ -2260,8 +2269,11 @@ class ClaudeMonitorApp:
 
     def _start_move(self, event: tk.Event) -> None:
         self._drag_x, self._drag_y = event.x, event.y
+        self._native_move = start_native_move(self.root)
 
     def _on_move(self, event: tk.Event) -> None:
+        if getattr(self, "_native_move", False):
+            return  # Windows標準の移動に任せた(FancyZonesが反応する)
         x = self.root.winfo_x() + (event.x - self._drag_x)
         y = self.root.winfo_y() + (event.y - self._drag_y)
         self.root.geometry(f"+{x}+{y}")
@@ -2404,7 +2416,7 @@ class ClaudeMonitorApp:
             chrome = self.root.winfo_reqheight() - self._scroll.winfo_reqheight()
             limit = self.root.winfo_screenheight() - SCREEN_MARGIN_PX
             self._height = min(chrome + content_h, limit)
-            self.root.geometry(f"{self._width}x{self._height}")
+            self._set_size(self._width, self._height)
             self.root.update_idletasks()
             view_h = self._scroll.winfo_height()
         overflow = content_h > view_h > 1
@@ -2442,7 +2454,28 @@ class ClaudeMonitorApp:
         self._width, self._height = width, height
         if resize_h:
             self._user_sized = True
-        self.root.geometry(f"{width}x{height}")
+        self._set_size(width, height)
+
+    def _set_size(self, width: int, height: int, position: str = "") -> None:
+        """自分でウィンドウサイズを変えるときは必ずここを通す(_on_root_configureが外部からの変更と区別するため)。"""
+        self._requested_sizes = (self._requested_sizes + [(width, height)])[-REQUESTED_SIZES_KEPT:]
+        self.root.geometry(f"{width}x{height}{position}")
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        """FancyZones・Windowsのスナップなど外部からサイズを変えられたら、そのサイズを採用する。
+        採用しないと、次の再描画で高さの自動調整(_fit_scroll_area)がゾーンの大きさを上書きしてしまう。"""
+        if event.widget is not self.root:
+            return  # rootへのbindは子ウィジェットのConfigureも拾う
+        size = (int(event.width), int(event.height))
+        if size[0] <= 1 or size[1] <= 1 or size == (self._width, self._height):
+            return
+        if size in self._requested_sizes:
+            return  # 自分で指定したサイズの反映(遅れて届いたものを含む)
+        logging.info("window resized externally: %sx%s", *size)
+        self._width, self._height = size
+        self._user_sized = True
+        self._requested_sizes = [size]
+        self._end_resize()
 
     def _end_resize(self) -> None:
         self._prefs.update(width=self._width)
@@ -2520,6 +2553,23 @@ def show_in_taskbar(root: tk.Tk) -> None:
         root.after(TASKBAR_REMAP_DELAY_MS, root.deiconify)
     except Exception:  # noqa: BLE001
         logging.warning("could not show in taskbar", exc_info=True)
+
+
+def start_native_move(root: tk.Tk) -> bool:
+    """Windowsでは、タイトルバーのドラッグをOS標準の移動として始める(FancyZones・スナップが反応するように)。
+    ボタンを離すまで戻らない。Windows以外・失敗時はFalse(呼び出し側が自前で動かす)。"""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+        user32.ReleaseCapture()
+        user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        return True
+    except Exception:  # noqa: BLE001
+        logging.warning("native window move failed", exc_info=True)
+        return False
 
 
 def main() -> None:
