@@ -132,5 +132,130 @@ class ColorrefTest(unittest.TestCase):
                 cm.colorref(bad)
 
 
+@unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display (use xvfb-run)")
+class Win32ChromeTest(unittest.TestCase):
+    """Windowsの枠なし+自前の—□✕。Win32呼び出しは差し替えて、アプリ側の振る舞いだけ確かめる。"""
+
+    def setUp(self):
+        self.applied = []
+        self.apply_result = True
+        self.minimized = 0
+        self.saved = []
+        patches = [
+            mock.patch.object(cm, "load_ui_prefs", lambda: {}),
+            mock.patch.object(cm, "save_ui_prefs", lambda p: self.saved.append(dict(p))),
+            mock.patch.object(cm, "get_sessions", lambda: []),
+            mock.patch.object(cm, "fetch_plan_usage", lambda: {}),
+            mock.patch.object(cm, "win32_apply_style", self._apply),
+            mock.patch.object(cm, "win32_minimize", self._minimize),
+            mock.patch.object(cm, "win32_work_area", lambda root: (0, 0, 900, 700)),
+            mock.patch.object(cm, "win32_start_move", lambda root: True),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.root = tk.Tk()
+        self.app = cm.ClaudeMonitorApp(self.root, native_frame=False, win32_chrome=True)
+        for _ in range(5):
+            self.root.update()
+
+    def tearDown(self):
+        self.root.destroy()
+        del self.app, self.root
+        gc.collect()
+
+    def _apply(self, root):
+        self.applied.append(1)
+        return self.apply_result
+
+    def _minimize(self, root):
+        self.minimized += 1
+
+    def caption_texts_left_to_right(self):
+        bar = self.app._maximize_btn.master
+        labels = [w for w in bar.winfo_children() if isinstance(w, tk.Label)
+                  and w.cget("text") in (cm.GLYPH_MINIMIZE, cm.GLYPH_MAXIMIZE, cm.GLYPH_RESTORE, cm.GLYPH_CLOSE)]
+        return [w.cget("text") for w in sorted(labels, key=lambda w: w.winfo_x())]
+
+    def test_caption_buttons_are_rightmost_in_order(self):
+        self.assertEqual(self.caption_texts_left_to_right(),
+                         [cm.GLYPH_MINIMIZE, cm.GLYPH_MAXIMIZE, cm.GLYPH_CLOSE])
+        bar = self.app._maximize_btn.master
+        others = [w.winfo_x() for w in bar.winfo_children() if isinstance(w, tk.Label)
+                  and w.cget("text") == "📌"]
+        self.assertTrue(others and others[0] < self.app._maximize_btn.winfo_x())  # 📌は—より左
+
+    def test_maximize_and_restore(self):
+        before = (self.app._width, self.app._height)
+        self.app._toggle_maximize()
+        for _ in range(5):
+            self.root.update()
+        self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (900, 700))
+        self.assertEqual(self.app._maximize_btn.cget("text"), cm.GLYPH_RESTORE)
+        self.app._render([], None)  # 自動の高さ調整で縮めない
+        self.root.update()
+        self.assertEqual(self.root.winfo_height(), 700)
+        self.assertFalse(self.app._user_sized)  # 最大化は外部リサイズとみなさない
+        self.app._toggle_maximize()
+        for _ in range(5):
+            self.root.update()
+        self.assertEqual(self.app._width, before[0])
+        self.assertEqual(self.app._maximize_btn.cget("text"), cm.GLYPH_MAXIMIZE)
+
+    def test_maximize_without_work_area_does_nothing(self):
+        with mock.patch.object(cm, "win32_work_area", lambda root: None):
+            self.app._toggle_maximize()
+        self.assertIsNone(self.app._maximized_from)
+
+    def test_minimize_uses_win32(self):
+        self.app._minimize()
+        self.assertEqual(self.minimized, 1)
+
+    def test_style_reapply_remaps_taskbar_at_most_limit(self):
+        self.apply_result = True
+        for _ in range(cm.TASKBAR_REMAP_MAX + 3):
+            self.app._ensure_win_style()
+        self.assertEqual(self.app._taskbar_remaps, cm.TASKBAR_REMAP_MAX)
+
+    def test_native_move_skips_manual_move(self):
+        ev = mock.Mock(x_root=100, y_root=100)
+        self.app._start_move(ev)
+        x0 = self.root.winfo_x()
+        self.app._on_move(mock.Mock(x_root=300, y_root=300))
+        self.root.update()
+        self.assertEqual(self.root.winfo_x(), x0)
+
+
+class Win32StyleTest(unittest.TestCase):
+    def test_target_style(self):
+        popup = cm.WS_POPUP | 0x02000000  # WS_POPUP|WS_CLIPCHILDREN(枠なしTkの既定)
+        style, ex = cm.win32_style_target(popup, cm.WS_EX_TOOLWINDOW)
+        self.assertFalse(style & cm.WS_POPUP)
+        self.assertTrue(style & cm.WS_MINIMIZEBOX)
+        self.assertTrue(style & 0x02000000)  # 他のビットは残す
+        self.assertFalse(ex & cm.WS_EX_TOOLWINDOW)
+        self.assertTrue(ex & cm.WS_EX_APPWINDOW)
+        # 符号付きで返ってきた値(GetWindowLongW)でも同じ結果
+        self.assertEqual(cm.win32_style_target(popup - 0x100000000, cm.WS_EX_TOOLWINDOW), (style, ex))
+        # 既に目的のスタイルなら変わらない
+        self.assertEqual(cm.win32_style_target(style, ex), (style, ex))
+
+    def test_as_long(self):
+        self.assertEqual(cm._as_long(0x80000000), -0x80000000)
+        self.assertEqual(cm._as_long(0x7FFFFFFF), 0x7FFFFFFF)
+        self.assertEqual(cm._as_long(0), 0)
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display (use xvfb-run)")
+class ManualMoveTest(ExternalResizeTest):
+    def test_drag_keeps_grab_offset(self):
+        self.root.geometry("+100+100")
+        self.root.update()
+        self.app._start_move(mock.Mock(x_root=150, y_root=110))  # 左上から(50,10)の位置を掴む
+        self.app._on_move(mock.Mock(x_root=400, y_root=300))
+        self.root.update()
+        self.assertEqual((self.root.winfo_x(), self.root.winfo_y()), (350, 290))
+
+
 if __name__ == "__main__":
     unittest.main()

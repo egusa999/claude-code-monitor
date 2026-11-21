@@ -149,11 +149,28 @@ ICON_ICO_PATH = APP_DIR / "claude_monitor.ico"
 ICON_WINDOW_PNG = APP_DIR / "claude_monitor_32.png"
 ICON_TITLEBAR_PNG = APP_DIR / "claude_monitor_20.png"
 APP_USER_MODEL_ID = "ClaudeCodeMonitor.GUI"  # タスクバーでpythonwとは別のアプリとして扱わせる(自前のアイコンを出す)
-# Windowsでは標準のタイトルバー・枠を使う(枠なしだとFancyZones・Windowsのスナップの対象外になるため、2026-11-22)。
-# 標準のタイトルバーはDWMの属性でアプリの色(COLOR_TITLEBAR)に塗る(Windows 11。Google KeepのPWAと同じ仕組み)。
-# Windows 10では色指定が効かないので暗色モードで代用する(20H1より古い版では白のまま)。
-USE_NATIVE_FRAME = os.name == "nt"
+# Windowsでは自前のタイトルバー(Keepのように—□✕もボタン類と同じ段)のまま、FancyZonesの対象にする(2026-11-22):
+# 枠なし(overrideredirect)のウィンドウはWS_POPUP=ポップアップ扱いでFancyZonesに無視されるため、WS_POPUPだけ外す
+# (枠・タイトルバーは付かない)。移動はタイトルバーのドラッグをOS標準の移動(WM_NCLBUTTONDOWN/HTCAPTION)にして
+# FancyZonesに検知させる。サイズ変更枠(WS_THICKFRAME)+WM_NCCALCSIZEのフックは実機で太い枠が出たので使わない。
+# 予備: 環境変数 CLAUDE_MONITOR_NATIVE_FRAME=1 でWindows標準のタイトルバー(DWMでアプリの色に塗る)に戻せる。
+USE_WIN32_CHROME = os.name == "nt"
+USE_NATIVE_FRAME = USE_WIN32_CHROME and os.environ.get("CLAUDE_MONITOR_NATIVE_FRAME") == "1"
 WINDOW_TITLE = "Claude Code Monitor"
+GWL_STYLE, GWL_EXSTYLE = -16, -20
+WS_POPUP, WS_MINIMIZEBOX = 0x80000000, 0x00020000
+WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = 0x00040000, 0x00000080
+SWP_FRAMECHANGED_FLAGS = 0x0020 | 0x0001 | 0x0002 | 0x0004 | 0x0010  # FRAMECHANGED|NOSIZE|NOMOVE|NOZORDER|NOACTIVATE
+WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
+SW_MINIMIZE = 6
+MONITOR_DEFAULTTONEAREST = 2
+WIN_STYLE_DELAY_MS = 150      # 表示されてから(ウィンドウハンドルができてから)スタイルを変える
+TASKBAR_REMAP_MAX = 3         # タスクバー表示のための出し直しの上限(Tkが枠を作り直し続けても点滅させない)
+# —□✕はWindowsのアイコン用フォント(Windows 10/11に標準搭載)
+CAPTION_GLYPH_FONT = ("Segoe MDL2 Assets", 8)
+GLYPH_MINIMIZE, GLYPH_MAXIMIZE, GLYPH_RESTORE, GLYPH_CLOSE = "\uE921", "\uE922", "\uE923", "\uE8BB"
+COLOR_CLOSE_HOVER_BG = "#c42b1c"   # Windowsの✕にマウスを乗せたときの赤
+COLOR_CAPTION_HOVER_BG = "#2a2f45"
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR = 34, 35, 36
 TITLEBAR_COLOR_DELAY_MS = 50
@@ -687,7 +704,14 @@ def get_sessions() -> list[SessionInfo]:
 CREDENTIALS_PATH = HOME / ".claude" / ".credentials.json"
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_API_BETA = "oauth-2025-04-20"
-USAGE_CACHE_SEC = 60.0          # API呼び出しの最短間隔(レート制限への配慮。表示の残り時間は手元で毎秒計算する)
+# API呼び出しの間隔。同じOAuthトークンでClaude Usageアプリ等も呼ぶため、60秒ではHTTP 429が出た(2026-11-22に延長)。
+# 表示の残り時間は手元で毎秒計算するので、間隔を延ばしても表示は止まらない。
+USAGE_CACHE_SEC = 300.0
+# 429のときはRetry-Afterに従い、無ければ待ちを倍々に延ばす(初回5分→最大30分)。成功したら通常間隔に戻す
+USAGE_BACKOFF_MIN_SEC = 300.0
+USAGE_BACKOFF_MAX_SEC = 1800.0
+HTTP_TOO_MANY_REQUESTS = 429
+USAGE_BUSY_ERROR = "使用量API混雑中(前回値)"
 USAGE_FETCH_TIMEOUT_SEC = 10
 # (APIのキー, 表示用キー, 枠の長さ[秒]) 経過率(ELAPSED)の計算に使う
 USAGE_WINDOWS: tuple[tuple[str, str, int], ...] = (
@@ -697,6 +721,24 @@ USAGE_WINDOWS: tuple[tuple[str, str, int], ...] = (
 _usage_lock = threading.Lock()
 _usage_cache: dict = {}
 _usage_cache_at = 0.0
+_usage_next_at = 0.0       # 次にAPIを呼んでよい時刻
+_usage_backoff_sec = 0.0   # 直近の429による待ち(0=通常)
+
+
+def parse_retry_after(value) -> float | None:
+    """Retry-Afterヘッダー(秒数のみ対応)を秒にする。無い・不正・負ならNone。"""
+    try:
+        sec = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return sec if sec >= 0 and sec == sec and sec != float("inf") else None
+
+
+def next_usage_backoff(previous_sec: float, retry_after: float | None) -> float:
+    """429のあとに待つ秒数。Retry-Afterがあればそれ以上、無ければ前回の倍(初回は最小値)、上限で頭打ち。"""
+    doubled = previous_sec * 2 if previous_sec > 0 else USAGE_BACKOFF_MIN_SEC
+    wait = max(doubled, retry_after or 0.0, USAGE_BACKOFF_MIN_SEC)
+    return min(wait, max(USAGE_BACKOFF_MAX_SEC, retry_after or 0.0))
 
 
 def _fetch_plan_usage_uncached() -> dict:
@@ -715,6 +757,9 @@ def _fetch_plan_usage_uncached() -> dict:
         with urllib.request.urlopen(req, timeout=USAGE_FETCH_TIMEOUT_SEC) as res:
             raw = json.load(res)
     except urllib.error.HTTPError as e:
+        if e.code == HTTP_TOO_MANY_REQUESTS:
+            retry = parse_retry_after(e.headers.get("Retry-After") if e.headers else None)
+            return {"error": USAGE_BUSY_ERROR, "_rate_limited": True, "_retry_after": retry}
         return {"error": f"使用量API HTTP {e.code}"}
     except (OSError, ValueError):
         return {"error": "使用量APIに接続できません"}
@@ -733,15 +778,26 @@ def _fetch_plan_usage_uncached() -> dict:
 def fetch_plan_usage() -> dict:
     """{"session"|"weekly": {"pct", "resets_at"(ISO8601), "window_sec"}} を返す。
     失敗時は"error"を付け、前回取得できた値があればそれも残す(表示を消さない)。"""
-    global _usage_cache, _usage_cache_at
+    global _usage_cache, _usage_cache_at, _usage_next_at, _usage_backoff_sec
     with _usage_lock:
-        if _usage_cache and time.time() - _usage_cache_at < USAGE_CACHE_SEC:
+        now = time.time()
+        if _usage_cache and now < _usage_next_at:
             return dict(_usage_cache)
         fresh = _fetch_plan_usage_uncached()
+        rate_limited = bool(fresh.pop("_rate_limited", False))
+        retry_after = fresh.pop("_retry_after", None)
+        if rate_limited:
+            _usage_backoff_sec = next_usage_backoff(_usage_backoff_sec, retry_after)
+            logging.warning("usage API 429; next try in %.0fs", _usage_backoff_sec)
+            wait = _usage_backoff_sec
+        else:
+            if "error" not in fresh:
+                _usage_backoff_sec = 0.0
+            wait = USAGE_CACHE_SEC
         if "error" in fresh:
             previous = {k: v for k, v in _usage_cache.items() if k != "error"}
             fresh = {**previous, **fresh}
-        _usage_cache, _usage_cache_at = fresh, time.time()
+        _usage_cache, _usage_cache_at, _usage_next_at = fresh, now, now + wait
         return dict(fresh)
 
 
@@ -1275,7 +1331,7 @@ class RemoteSessionSource:
 
 
 HTTP_UNAUTHORIZED = 401
-USAGE_POLL_SEC = 60.0  # GUIがプラン使用量を取り直す間隔(サーバー側でも同じ間隔でキャッシュする)
+USAGE_POLL_SEC = 60.0  # GUIがプラン使用量を取り直す間隔(サーバーがAPIを呼ぶのは5分以上おき。ここは軽いキャッシュ読みのみ)
 
 
 class UsageSource:
@@ -1938,9 +1994,15 @@ class SessionRow(tk.Frame):
 
 class ClaudeMonitorApp:
     def __init__(self, root: tk.Tk, remote: RemoteSessionSource | None = None,
-                 ssh_host: str | None = None, native_frame: bool = USE_NATIVE_FRAME):
+                 ssh_host: str | None = None, native_frame: bool = USE_NATIVE_FRAME,
+                 win32_chrome: bool = USE_WIN32_CHROME):
         self.root = root
         self._native_frame = native_frame
+        # Windowsの枠なし: —□✕を自前で出し、OS標準の移動・FancyZones対応のスタイル調整をする
+        self._win32_chrome = win32_chrome and not native_frame
+        self._maximized_from: tuple[int, int, int, int] | None = None  # 最大化前の(幅,高さ,x,y)
+        self._native_move = False
+        self._taskbar_remaps = 0
         self._remote = remote
         self._ssh_host = ssh_host
         self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
@@ -1992,6 +2054,8 @@ class ClaudeMonitorApp:
         self._blink()
         if native_frame:
             root.after(TITLEBAR_COLOR_DELAY_MS, lambda: color_titlebar(root))
+        if self._win32_chrome:
+            root.after(WIN_STYLE_DELAY_MS, self._ensure_win_style)
 
     # -- UI構築 -------------------------------------------------------
 
@@ -2008,19 +2072,26 @@ class ClaudeMonitorApp:
                 tk.Label(
                     bar, text="●", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT, font=("Segoe UI", 10, "bold"),
                 ).pack(side="left", padx=(14, 0))
-            tk.Label(
+            title = tk.Label(
                 bar, text=WINDOW_TITLE, bg=COLOR_TITLEBAR,
                 fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"),
-            ).pack(side="left", padx=(6, 0))
-
-            close_btn = tk.Label(
-                bar, text="✕", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
-                font=("Segoe UI", 10), cursor="hand2",
             )
-            close_btn.pack(side="right", padx=12)
-            close_btn.bind("<Button-1>", lambda e: self.root.destroy())
-            close_btn.bind("<Enter>", lambda e: close_btn.config(fg=COLOR_RED_ON))
-            close_btn.bind("<Leave>", lambda e: close_btn.config(fg=COLOR_TEXT_DIM))
+            title.pack(side="left", padx=(6, 0))
+            for widget in bar.winfo_children():  # アイコン・題名の上でもドラッグで動かせるように
+                widget.bind("<ButtonPress-1>", self._start_move)
+                widget.bind("<B1-Motion>", self._on_move)
+
+            if self._win32_chrome:
+                self._build_caption_buttons(bar)
+            else:
+                close_btn = tk.Label(
+                    bar, text="✕", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
+                    font=("Segoe UI", 10), cursor="hand2",
+                )
+                close_btn.pack(side="right", padx=12)
+                close_btn.bind("<Button-1>", lambda e: self.root.destroy())
+                close_btn.bind("<Enter>", lambda e: close_btn.config(fg=COLOR_RED_ON))
+                close_btn.bind("<Leave>", lambda e: close_btn.config(fg=COLOR_TEXT_DIM))
 
         self._pin_btn = tk.Label(
             bar, text="📌", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM,
@@ -2061,10 +2132,62 @@ class ClaudeMonitorApp:
             bar.bind("<ButtonPress-1>", self._start_move)
             bar.bind("<B1-Motion>", self._on_move)
 
+    def _build_caption_buttons(self, bar: tk.Frame) -> None:
+        """Keepのように、右端に—□✕を並べる(packはside="right"なので✕→□→—の順に置く)。"""
+        specs = (
+            (GLYPH_CLOSE, self.root.destroy, COLOR_CLOSE_HOVER_BG),
+            (GLYPH_MAXIMIZE, self._toggle_maximize, COLOR_CAPTION_HOVER_BG),
+            (GLYPH_MINIMIZE, self._minimize, COLOR_CAPTION_HOVER_BG),
+        )
+        for glyph, action, hover_bg in specs:
+            btn = tk.Label(bar, text=glyph, bg=COLOR_TITLEBAR, fg=COLOR_TEXT,
+                           font=CAPTION_GLYPH_FONT, width=5)
+            btn.pack(side="right", fill="y")
+            btn.bind("<Button-1>", lambda e, a=action: a())
+            btn.bind("<Enter>", lambda e, b=btn, c=hover_bg: b.config(bg=c))
+            btn.bind("<Leave>", lambda e, b=btn: b.config(bg=COLOR_TITLEBAR))
+            if action == self._toggle_maximize:
+                self._maximize_btn = btn
+
+    def _minimize(self) -> None:
+        # 枠なし(overrideredirect)のウィンドウはTkのiconify()が使えないので、OSに直接最小化させる
+        win32_minimize(self.root)
+
+    def _toggle_maximize(self) -> None:
+        """作業領域(タスクバーを除く画面)いっぱいに広げる/元に戻す。サイズは保存しない。"""
+        if self._maximized_from is not None:
+            w, h, x, y = self._maximized_from
+            self._maximized_from = None
+            self._width, self._height = w, h
+            self._set_size(w, h, f"+{x}+{y}")
+        else:
+            area = win32_work_area(self.root)
+            if area is None:
+                return
+            self._maximized_from = (self._width, self._height,
+                                    self.root.winfo_x(), self.root.winfo_y())
+            x, y, w, h = area
+            self._width, self._height = w, h
+            self._set_size(w, h, f"+{x}+{y}")
+        if hasattr(self, "_maximize_btn"):
+            self._maximize_btn.config(
+                text=GLYPH_RESTORE if self._maximized_from is not None else GLYPH_MAXIMIZE)
+
+    def _ensure_win_style(self) -> None:
+        """FancyZones対応のスタイルになっているか確かめ、外れていれば付け直す(Tkが枠を作り直すと戻るため、
+        定期的に呼ぶ)。拡張スタイル(タスクバー表示)は一度隠して出し直さないと反映されない。"""
+        if not self._win32_chrome:
+            return
+        if win32_apply_style(self.root) and self._taskbar_remaps < TASKBAR_REMAP_MAX:
+            self._taskbar_remaps += 1
+            self.root.withdraw()
+            self.root.after(WIN_STYLE_DELAY_MS, self.root.deiconify)
+
     def _toggle_topmost(self) -> None:
         """最前面固定のオン/オフ。枠なしウィンドウはタスクバーに出ないため、切り替え手段を残す。"""
         self._topmost = not self._topmost
         self.root.attributes("-topmost", self._topmost)
+        self._ensure_win_style()
         self._pin_btn.config(fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM)
         self._prefs["topmost"] = self._topmost
         save_ui_prefs(self._prefs)
@@ -2275,11 +2398,16 @@ class ClaudeMonitorApp:
             relx=1.0, x=-ROW_PADDING_X, y=8, anchor="ne")
 
     def _start_move(self, event: tk.Event) -> None:
-        self._drag_x, self._drag_y = event.x, event.y
+        self._drag_x, self._drag_y = event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y()
+        # WindowsではOS標準の移動にする(FancyZonesはこれを検知してゾーンを出す)。ボタンを離すまで戻らない
+        self._native_move = self._win32_chrome and win32_start_move(self.root)
 
     def _on_move(self, event: tk.Event) -> None:
-        x = self.root.winfo_x() + (event.x - self._drag_x)
-        y = self.root.winfo_y() + (event.y - self._drag_y)
+        if self._native_move:
+            return
+        # 掴んだ位置(ウィンドウ左上からのずれ)を保つ。題名・アイコンの上で掴んでもずれないよう画面座標で計算する
+        x = event.x_root - self._drag_x
+        y = event.y_root - self._drag_y
         self.root.geometry(f"+{x}+{y}")
 
     # -- UUID表示 -------------------------------------------------------
@@ -2300,6 +2428,7 @@ class ClaudeMonitorApp:
         self._update_kickoff_panel()
         self._usage_panel.update_usage(self._usage_source.get())  # 残り時間・経過率は毎回手元で再計算
         self._render(sessions, error)
+        self._ensure_win_style()
         self.root.after(POLL_INTERVAL_MS, self.refresh)
 
     def _render(self, sessions: list[SessionInfo], error: str | None) -> None:
@@ -2416,7 +2545,7 @@ class ClaudeMonitorApp:
         self.root.update_idletasks()
         content_h = self.body.winfo_reqheight()
         view_h = self._scroll.winfo_height()
-        if not self._user_sized:
+        if not self._user_sized and self._maximized_from is None:
             chrome = self.root.winfo_reqheight() - self._scroll.winfo_reqheight()
             limit = self.root.winfo_screenheight() - SCREEN_MARGIN_PX
             self._height = min(chrome + content_h, limit)
@@ -2549,6 +2678,97 @@ def colorref(hex_color: str) -> int:
         raise ValueError(f"not a #rrggbb color: {hex_color!r}")
     r, g, b = (int(value[i:i + 2], 16) for i in (0, 2, 4))
     return (b << 16) | (g << 8) | r
+
+
+def _wrapper_hwnd(root: tk.Tk) -> int:
+    """Tkのトップレベルの外枠(OSが扱うウィンドウ)のハンドル。winfo_idは中の子ウィンドウなので親を取る。"""
+    import ctypes
+    return ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+
+
+def _as_long(value: int) -> int:
+    """32bitの符号なし値をSetWindowLongWが受け取る符号付きLONGにする。"""
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def win32_style_target(style: int, ex_style: int) -> tuple[int, int]:
+    """FancyZonesの対象にするためのスタイル: WS_POPUPを外し(ポップアップ扱いをやめる)、最小化可能にする。
+    拡張スタイルはツールウィンドウをやめてタスクバーに出す。枠・タイトルバーは付けない。"""
+    style = (style & 0xFFFFFFFF & ~WS_POPUP) | WS_MINIMIZEBOX
+    ex_style = (ex_style & 0xFFFFFFFF & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+    return style, ex_style
+
+
+def win32_apply_style(root: tk.Tk) -> bool:
+    """スタイルを付け直したらTrue(既に付いている・失敗したらFalse)。結果はapp.logに残す(実機調査用)。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = _wrapper_hwnd(root)
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+        ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF
+        want_style, want_ex = win32_style_target(style, ex_style)
+        if (style, ex_style) == (want_style, want_ex):
+            return False
+        user32.SetWindowLongW(hwnd, GWL_STYLE, _as_long(want_style))
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, _as_long(want_ex))
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED_FLAGS)
+        logging.info("window style hwnd=%#x style %#010x->%#010x (now %#010x) ex %#010x->%#010x (now %#010x)",
+                     hwnd, style, want_style, user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF,
+                     ex_style, want_ex, user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF)
+        return True
+    except Exception:  # noqa: BLE001 - 見た目・スナップのための処理でアプリを止めない
+        logging.warning("could not set window style", exc_info=True)
+        return False
+
+
+def win32_start_move(root: tk.Tk) -> bool:
+    """タイトルバーのドラッグをOS標準の移動として始める(FancyZones・スナップが反応する)。失敗したらFalse。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = _wrapper_hwnd(root)
+        user32.ReleaseCapture()
+        user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        return True
+    except Exception:  # noqa: BLE001
+        logging.warning("native window move failed", exc_info=True)
+        return False
+
+
+def win32_minimize(root: tk.Tk) -> None:
+    try:
+        import ctypes
+        ctypes.windll.user32.ShowWindow(_wrapper_hwnd(root), SW_MINIMIZE)
+    except Exception:  # noqa: BLE001
+        logging.warning("minimize failed", exc_info=True)
+
+
+def win32_work_area(root: tk.Tk) -> tuple[int, int, int, int] | None:
+    """ウィンドウがある画面の作業領域(タスクバーを除く) (x, y, 幅, 高さ)。失敗したらNone。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MonitorInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromWindow(_wrapper_hwnd(root), MONITOR_DEFAULTTONEAREST)
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(MonitorInfo)
+        if not monitor or not user32.GetMonitorInfoW(ctypes.c_void_p(monitor), ctypes.byref(info)):
+            return None
+        r = info.rcWork
+        if r.right <= r.left or r.bottom <= r.top:
+            return None
+        return r.left, r.top, r.right - r.left, r.bottom - r.top
+    except Exception:  # noqa: BLE001
+        logging.warning("could not get work area", exc_info=True)
+        return None
 
 
 def color_titlebar(root: tk.Tk) -> None:
