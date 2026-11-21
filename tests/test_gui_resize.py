@@ -13,6 +13,7 @@ import claude_monitor as cm
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display (use xvfb-run)")
 class ExternalResizeTest(unittest.TestCase):
+    NATIVE_FRAME = False  # Windows以外の既定(枠なし+自前のタイトルバー)
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         prefs = Path(self.tmp.name) / "ui.json"
@@ -27,7 +28,7 @@ class ExternalResizeTest(unittest.TestCase):
             self.addCleanup(p.stop)
         self.saved = []
         self.root = tk.Tk()
-        self.app = cm.ClaudeMonitorApp(self.root)
+        self.app = cm.ClaudeMonitorApp(self.root, native_frame=self.NATIVE_FRAME)
         self.pump()
 
     def tearDown(self):
@@ -88,6 +89,47 @@ class ExternalResizeTest(unittest.TestCase):
         before = (self.app._width, self.app._height, self.app._user_sized)
         self.app._on_root_configure(mock.Mock(widget=self.root, width=1, height=1))
         self.assertEqual((self.app._width, self.app._height, self.app._user_sized), before)
+
+    def _labels_texts(self):
+        texts = []
+        stack = [self.root]
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            if isinstance(w, tk.Label):
+                texts.append(w.cget("text"))
+        return texts
+
+    def test_frame_mode(self):
+        self.assertEqual(self.root.title(), cm.WINDOW_TITLE)
+        borderless = bool(self.root.overrideredirect())
+        self.assertEqual(borderless, not self.NATIVE_FRAME)
+        texts = self._labels_texts()
+        # 標準の枠ではアイコン・題名・✕はOS側にあるので帯に出さない。ボタン(↻・📌)は残す
+        self.assertEqual("✕" in texts, not self.NATIVE_FRAME)
+        self.assertEqual(cm.WINDOW_TITLE in texts, not self.NATIVE_FRAME)
+        self.assertIn("↻", texts)
+        self.assertIn("📌", texts)
+
+
+class NativeFrameTest(ExternalResizeTest):
+    """Windowsの既定(標準のタイトルバー・枠)。外部リサイズの扱いは同じであること。"""
+    NATIVE_FRAME = True
+
+    def test_own_resize_handle_still_clamps(self):
+        self.skipTest("標準の枠ではリサイズハンドルを作らない(OSの枠で行う)")
+
+
+class ColorrefTest(unittest.TestCase):
+    def test_converts_to_bgr(self):
+        self.assertEqual(cm.colorref("#12141d"), 0x1D1412)
+        self.assertEqual(cm.colorref("#ff0000"), 0x0000FF)
+        self.assertEqual(cm.colorref("#000000"), 0)
+
+    def test_rejects_bad_values(self):
+        for bad in ("", "#fff", "#12345", "red"):
+            with self.assertRaises(ValueError):
+                cm.colorref(bad)
 
 
 if __name__ == "__main__":

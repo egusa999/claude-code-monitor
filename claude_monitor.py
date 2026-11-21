@@ -149,13 +149,14 @@ ICON_ICO_PATH = APP_DIR / "claude_monitor.ico"
 ICON_WINDOW_PNG = APP_DIR / "claude_monitor_32.png"
 ICON_TITLEBAR_PNG = APP_DIR / "claude_monitor_20.png"
 APP_USER_MODEL_ID = "ClaudeCodeMonitor.GUI"  # タスクバーでpythonwとは別のアプリとして扱わせる(自前のアイコンを出す)
-GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = -20, 0x00040000, 0x00000080
-# FancyZonesはWindows標準の移動(タイトルバーのドラッグ)を検知してゾーンを出すため、自前のドラッグではなく
-# WM_NCLBUTTONDOWN(HTCAPTION)で標準の移動を始める。サイズ変更枠(WS_THICKFRAME)は実機で太い枠が出たので付けない
-# (2026-11-22)。そのため枠なしウィンドウはFancyZonesでは「ポップアップ」扱いになり、
-# FancyZonesの設定「ポップアップウィンドウのスナップを許可」をオンにする必要がある。
-WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
-TASKBAR_REMAP_DELAY_MS = 150
+# Windowsでは標準のタイトルバー・枠を使う(枠なしだとFancyZones・Windowsのスナップの対象外になるため、2026-11-22)。
+# 標準のタイトルバーはDWMの属性でアプリの色(COLOR_TITLEBAR)に塗る(Windows 11。Google KeepのPWAと同じ仕組み)。
+# Windows 10では色指定が効かないので暗色モードで代用する(20H1より古い版では白のまま)。
+USE_NATIVE_FRAME = os.name == "nt"
+WINDOW_TITLE = "Claude Code Monitor"
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR = 34, 35, 36
+TITLEBAR_COLOR_DELAY_MS = 50
 # プラン使用量パネル(Claude Usageアプリと同じ表。スクロール領域の外に固定)
 USAGE_PANEL_HEIGHT = 76
 USAGE_HEADER_Y = 10
@@ -1937,8 +1938,9 @@ class SessionRow(tk.Frame):
 
 class ClaudeMonitorApp:
     def __init__(self, root: tk.Tk, remote: RemoteSessionSource | None = None,
-                 ssh_host: str | None = None):
+                 ssh_host: str | None = None, native_frame: bool = USE_NATIVE_FRAME):
         self.root = root
+        self._native_frame = native_frame
         self._remote = remote
         self._ssh_host = ssh_host
         self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
@@ -1946,7 +1948,9 @@ class ClaudeMonitorApp:
         self._revealed: set[str] = set()
         self._last_sessions: list[SessionInfo] = []
 
-        root.overrideredirect(True)
+        root.title(WINDOW_TITLE)
+        if not native_frame:
+            root.overrideredirect(True)  # Windows以外は従来どおり枠なし+自前のタイトルバー
         self._icons = apply_app_icon(root)  # 参照を保持(消えるとアイコンが表示されない)
         root.configure(bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         self._prefs = load_ui_prefs()
@@ -1981,11 +1985,13 @@ class ClaudeMonitorApp:
             self.body, text="アクティブなセッションはありません",
             bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9),
         )
-        self._build_resize_handles()
+        if not native_frame:
+            self._build_resize_handles()  # 標準の枠ならOSの枠でリサイズできる
 
         self.refresh()
         self._blink()
-        root.after(TASKBAR_REMAP_DELAY_MS, lambda: show_in_taskbar(root))
+        if native_frame:
+            root.after(TITLEBAR_COLOR_DELAY_MS, lambda: color_titlebar(root))
 
     # -- UI構築 -------------------------------------------------------
 
@@ -1994,25 +2000,27 @@ class ClaudeMonitorApp:
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
 
-        if "titlebar" in self._icons:
-            tk.Label(bar, image=self._icons["titlebar"], bg=COLOR_TITLEBAR).pack(side="left", padx=(12, 0))
-        else:
+        # 標準の枠のときは、アイコン・題名・✕はOSのタイトルバーにあるので、この帯はボタンの段だけにする
+        if not self._native_frame:
+            if "titlebar" in self._icons:
+                tk.Label(bar, image=self._icons["titlebar"], bg=COLOR_TITLEBAR).pack(side="left", padx=(12, 0))
+            else:
+                tk.Label(
+                    bar, text="●", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT, font=("Segoe UI", 10, "bold"),
+                ).pack(side="left", padx=(14, 0))
             tk.Label(
-                bar, text="●", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT, font=("Segoe UI", 10, "bold"),
-            ).pack(side="left", padx=(14, 0))
-        tk.Label(
-            bar, text="Claude Code Monitor", bg=COLOR_TITLEBAR,
-            fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"),
-        ).pack(side="left", padx=(6, 0))
+                bar, text=WINDOW_TITLE, bg=COLOR_TITLEBAR,
+                fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"),
+            ).pack(side="left", padx=(6, 0))
 
-        close_btn = tk.Label(
-            bar, text="✕", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
-            font=("Segoe UI", 10), cursor="hand2",
-        )
-        close_btn.pack(side="right", padx=12)
-        close_btn.bind("<Button-1>", lambda e: self.root.destroy())
-        close_btn.bind("<Enter>", lambda e: close_btn.config(fg=COLOR_RED_ON))
-        close_btn.bind("<Leave>", lambda e: close_btn.config(fg=COLOR_TEXT_DIM))
+            close_btn = tk.Label(
+                bar, text="✕", bg=COLOR_TITLEBAR, fg=COLOR_TEXT_DIM,
+                font=("Segoe UI", 10), cursor="hand2",
+            )
+            close_btn.pack(side="right", padx=12)
+            close_btn.bind("<Button-1>", lambda e: self.root.destroy())
+            close_btn.bind("<Enter>", lambda e: close_btn.config(fg=COLOR_RED_ON))
+            close_btn.bind("<Leave>", lambda e: close_btn.config(fg=COLOR_TEXT_DIM))
 
         self._pin_btn = tk.Label(
             bar, text="📌", bg=COLOR_TITLEBAR, fg=COLOR_ACCENT if self._topmost else COLOR_TEXT_DIM,
@@ -2049,10 +2057,9 @@ class ClaudeMonitorApp:
         if self._remote is not None:
             self._build_kickoff_toggle(bar)
 
-        # ウィンドウドラッグ
-        for widget in (bar,):
-            widget.bind("<ButtonPress-1>", self._start_move)
-            widget.bind("<B1-Motion>", self._on_move)
+        if not self._native_frame:  # 枠なしのときだけ自前でドラッグ移動する
+            bar.bind("<ButtonPress-1>", self._start_move)
+            bar.bind("<B1-Motion>", self._on_move)
 
     def _toggle_topmost(self) -> None:
         """最前面固定のオン/オフ。枠なしウィンドウはタスクバーに出ないため、切り替え手段を残す。"""
@@ -2269,11 +2276,8 @@ class ClaudeMonitorApp:
 
     def _start_move(self, event: tk.Event) -> None:
         self._drag_x, self._drag_y = event.x, event.y
-        self._native_move = start_native_move(self.root)
 
     def _on_move(self, event: tk.Event) -> None:
-        if getattr(self, "_native_move", False):
-            return  # Windows標準の移動に任せた(FancyZonesが反応する)
         x = self.root.winfo_x() + (event.x - self._drag_x)
         y = self.root.winfo_y() + (event.y - self._drag_y)
         self.root.geometry(f"+{x}+{y}")
@@ -2538,38 +2542,33 @@ def apply_app_icon(root: tk.Tk) -> dict[str, tk.PhotoImage]:
     return images
 
 
-def show_in_taskbar(root: tk.Tk) -> None:
-    """枠なし(overrideredirect)のウィンドウは既定ではタスクバーに出ないため、Windowsでだけ表示させる。
-    拡張スタイルを変えたあと、一度隠して出し直さないと反映されない。失敗しても何もしない。"""
-    if os.name != "nt":
-        return
+def colorref(hex_color: str) -> int:
+    """'#rrggbb' をWindowsのCOLORREF(0x00BBGGRR)にする。"""
+    value = hex_color.lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"not a #rrggbb color: {hex_color!r}")
+    r, g, b = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return (b << 16) | (g << 8) | r
+
+
+def color_titlebar(root: tk.Tk) -> None:
+    """Windows標準のタイトルバーをアプリの色に塗る(Windows 11)。Windows 10は暗色モードのみ効く。
+    非対応の版では属性ごとに失敗(戻り値が0以外)するだけなので、全部試す。失敗時は白のまま。"""
     try:
         import ctypes
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
-        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+        set_attr = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        for attr, raw in ((DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
+                          (DWMWA_CAPTION_COLOR, colorref(COLOR_TITLEBAR)),
+                          (DWMWA_TEXT_COLOR, colorref(COLOR_TEXT)),
+                          (DWMWA_BORDER_COLOR, colorref(COLOR_BORDER))):
+            value = ctypes.c_uint(raw)
+            set_attr(hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
+        # 既に表示済みのタイトルバーは再描画しないと色が変わらないことがあるため、一度だけ出し直す
         root.withdraw()
-        root.after(TASKBAR_REMAP_DELAY_MS, root.deiconify)
-    except Exception:  # noqa: BLE001
-        logging.warning("could not show in taskbar", exc_info=True)
-
-
-def start_native_move(root: tk.Tk) -> bool:
-    """Windowsでは、タイトルバーのドラッグをOS標準の移動として始める(FancyZones・スナップが反応するように)。
-    ボタンを離すまで戻らない。Windows以外・失敗時はFalse(呼び出し側が自前で動かす)。"""
-    if os.name != "nt":
-        return False
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
-        user32.ReleaseCapture()
-        user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-        return True
-    except Exception:  # noqa: BLE001
-        logging.warning("native window move failed", exc_info=True)
-        return False
+        root.deiconify()
+    except Exception:  # noqa: BLE001 - 見た目だけの処理でアプリを止めない
+        logging.warning("could not enable dark title bar", exc_info=True)
 
 
 def main() -> None:
