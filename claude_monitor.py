@@ -105,6 +105,8 @@ TRUST_DETECT_TIMEOUT_SEC = 20.0       # 作成直後、信頼確認の画面が�
 INIT_READY_TIMEOUT_SEC = 10 * 60.0    # 信頼確認などに本人が答えて入力欄が出るまで待つ上限(超えたら何も送らない)
 INIT_READY_STABLE_SEC = 3.0           # 入力欄が空で待機中の状態がこの秒数続いたら送信する
 TRUST_PROMPT_MARKER = "trust"         # 画面にこれが出ている間は絶対に送らない(Enterが「Yes」を承認してしまうため)
+TRUST_YES_LABEL = "yes, i trust"     # 信頼確認の選択肢「Yes, I trust this folder」(小文字で前方一致)
+TRUST_CURSOR_MOVE_MAX = 3            # 承認時にカーソルをYesへ動かす最大回数
 END_POLL_SEC = 1.0                    # 状態確認の間隔
 END_ENTER_DELAY_SEC = 0.5             # 文字列送信からEnter送信までの間隔
 END_START_TIMEOUT_SEC = 60.0          # この間に「作業中」にならなければ失敗(削除しない)
@@ -839,6 +841,26 @@ def call_session_ctl(ssh_host: str, cmd: str, runner=subprocess.run, **params) -
             f"端末で一度 ssh {ssh_host} を実行してください") from e
     except OSError as e:
         raise SessionCtlError(f"sshを起動できません: {e}") from e
+    return _parse_ctl_response(proc, cmd)
+
+
+def call_session_ctl_local(cmd: str, runner=subprocess.run, **params) -> object:
+    """サーバー自身(Web版)から claude-session-ctl を直接呼ぶ(sshを通さない)。応答の扱いはssh版と同じ。"""
+    payload = json.dumps({"cmd": cmd, **params}, ensure_ascii=True)
+    if cmd not in SESSION_CTL_QUIET_CMDS:
+        logging.info("ctl(local) %s %s", cmd, {k: v for k, v in params.items() if k in ("name", "dir", "base", "key")})
+    try:
+        proc = runner([SESSION_CTL_COMMAND], input=payload, capture_output=True, text=True, encoding="utf-8",
+                      errors="replace", timeout=SESSION_CTL_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired as e:
+        raise SessionCtlError(f"{SESSION_CTL_COMMAND} が{SESSION_CTL_TIMEOUT_SEC}秒以内に応答しませんでした") from e
+    except OSError as e:
+        raise SessionCtlError(f"{SESSION_CTL_COMMAND} を起動できません: {e}") from e
+    return _parse_ctl_response(proc, cmd)
+
+
+def _parse_ctl_response(proc, cmd: str) -> object:
+    """claude-session-ctl の標準出力(JSON)を解釈してresultを返す。失敗はSessionCtlError。"""
     try:
         response = json.loads(proc.stdout)
     except ValueError:
@@ -1020,6 +1042,65 @@ def wait_for_trust_prompt(name: str, ctl, sleep=time.sleep, clock=time.monotonic
     logging.warning("'%s': neither trust prompt nor input box within %ss; pane: %s",
                     name, TRUST_DETECT_TIMEOUT_SEC, pane_summary(pane))
     return False
+
+
+def pane_plain_lines(pane: str) -> list[str]:
+    """画面をエスケープ除去・空行除去した行のリストにする(表示用・判定用)。"""
+    lines = [ANSI_ESCAPE_PATTERN.sub("", ln).rstrip() for ln in pane.splitlines()]
+    return [ln for ln in lines if ln.strip()]
+
+
+def _trust_options(pane: str) -> tuple[int, int] | None:
+    """信頼確認の画面から (カーソル行の位置, 「Yes」行の位置) を返す。信頼確認でない・判定不能ならNone。
+    選択肢の並び(2.1.288は「No, exit」が上・「Yes, I trust this folder」が下)は版で変わりうるので画面から読む。"""
+    if TRUST_PROMPT_MARKER not in ANSI_ESCAPE_PATTERN.sub("", pane).lower():
+        return None
+    cursor, yes = None, None
+    for i, line in enumerate(pane_plain_lines(pane)):
+        text = line.strip()
+        is_cursor = text.startswith(PANE_PROMPT_CHAR)
+        if is_cursor:
+            if cursor is not None:
+                return None  # カーソルが2つ見える(判定不能)
+            cursor = i
+            text = text[len(PANE_PROMPT_CHAR):].strip()
+        label = re.sub(r"^\d+\.\s*", "", text).lower()  # 「1. Yes, ...」の番号を外す
+        if label.startswith(TRUST_YES_LABEL):
+            if yes is not None:
+                return None
+            yes = i
+    if cursor is None or yes is None:
+        return None
+    return cursor, yes
+
+
+def trust_cursor_choice(pane: str) -> str | None:
+    """信頼確認の画面でカーソル(❯)が「Yes」上なら"yes"、別の選択肢上なら"other"、判定不能・信頼確認でなければNone。"""
+    found = _trust_options(pane)
+    if found is None:
+        return None
+    return "yes" if found[0] == found[1] else "other"
+
+
+def approve_trust(name: str, ctl, sleep=time.sleep) -> None:
+    """信頼確認の「Yes」を選んでEnterを送る。本人が画面を見て承認ボタンを押したときだけ呼ぶ(自動承認はしない)。
+    カーソルがYes上にあると画面で確認できたときだけEnterを送り、確認できなければ何も送らずSessionCtlError。"""
+    pane = str(ctl(SESSION_CTL_CAPTURE, name=name))
+    found = _trust_options(pane)
+    if found is None:
+        raise SessionCtlError("信頼確認の画面が見つかりません(既に答え済みか、画面の形式が想定と違います)")
+    for _ in range(TRUST_CURSOR_MOVE_MAX):
+        if found is None or found[0] == found[1]:
+            break
+        ctl(SESSION_CTL_SEND_KEY, name=name, key="Down" if found[1] > found[0] else "Up")
+        sleep(END_ENTER_DELAY_SEC)
+        pane = str(ctl(SESSION_CTL_CAPTURE, name=name))
+        found = _trust_options(pane)
+    if found is None or found[0] != found[1]:
+        logging.warning("'%s': could not move the cursor to Yes; pane: %s", name, pane_summary(pane))
+        raise SessionCtlError("カーソルを「Yes」に合わせられませんでした(Enterは送っていません)。端末で答えてください")
+    logging.info("'%s': trust approved by the user; sending Enter", name)
+    ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
 
 
 def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=time.monotonic) -> None:

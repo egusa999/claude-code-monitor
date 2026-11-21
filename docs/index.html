@@ -6,7 +6,7 @@
 <title>Claude Code Monitor</title>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="icon.svg">
+<link rel="apple-touch-icon" href="icon-192.png">
 <meta name="theme-color" content="#171a26">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -61,7 +61,7 @@
   .titlebar .dot { color: var(--accent); margin-right: 6px; }
   .header {
     display: grid;
-    grid-template-columns: 1fr 190px 60px;
+    grid-template-columns: minmax(0, 1fr) 190px 60px;
     padding: 8px 14px 6px;
     font-size: 11px;
     color: var(--text-dim);
@@ -75,7 +75,7 @@
   .agent .agent-lamp.working { background: #ff4d4f; animation: blink 1s steps(2, start) infinite; }
   .row {
     display: grid;
-    grid-template-columns: 1fr 190px 60px;
+    grid-template-columns: minmax(0, 1fr) 190px 60px;
     align-items: center;
     padding: 10px 14px;
     font-size: 14px;
@@ -171,7 +171,76 @@
     height: 8px;
     flex-shrink: 0;
   }
-  .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px; }
+  .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .name { min-width: 0; overflow-wrap: anywhere; }
+  .end-btn {
+    font-weight: 400; font-size: 10px; color: var(--text-dim); margin-left: 4px; padding: 1px 6px;
+    background: var(--track); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+  }
+  .end-btn:hover { color: var(--text); border-color: var(--red-on); }
+  .end-btn:disabled { opacity: 0.6; cursor: default; }
+  /* --- 実行中の操作(作成・終了)と信頼確認 --- */
+  .jobs { border-bottom: 1px solid var(--border); }
+  .job { padding: 8px 14px; font-size: 12px; background: var(--titlebar); border-top: 1px solid var(--border); }
+  .job-head { display: flex; align-items: center; gap: 8px; }
+  .job-head .job-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .job.error .job-text { color: var(--red-on); }
+  .job.done .job-text { color: var(--green); }
+  .job-head button { background: none; border: none; color: var(--text-dim); font-size: 14px; cursor: pointer; padding: 2px 6px; }
+  .job pre {
+    margin: 8px 0; padding: 8px; max-height: 40vh; overflow: auto; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px; font-size: 11px; line-height: 1.4; white-space: pre-wrap;
+  }
+  .job-actions { display: flex; gap: 8px; }
+  .btn {
+    flex: 1; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--track);
+    color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  /* --- ＋(フォルダからセッション作成)のシート --- */
+  .sheet-backdrop {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 10;
+    display: flex; align-items: flex-end; justify-content: center;
+  }
+  .sheet {
+    width: 100%; max-width: 560px; max-height: 92vh; max-height: 92dvh; display: flex; flex-direction: column;
+    background: var(--row-bg); border: 1px solid var(--border); border-radius: 12px 12px 0 0; padding: 14px;
+  }
+  @media (min-width: 601px) { .sheet-backdrop { align-items: center; } .sheet { border-radius: 12px; max-height: 80vh; } }
+  .sheet h2 { font-size: 15px; margin: 0 0 10px; display: flex; justify-content: space-between; align-items: center; }
+  .sheet h2 button { background: none; border: none; color: var(--text-dim); font-size: 18px; cursor: pointer; }
+  .base-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .base-tabs button {
+    padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--track);
+    color: var(--text-dim); font-size: 12px; cursor: pointer;
+  }
+  .base-tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .folder-list { flex: 1 1 auto; min-height: 120px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+  .folder-list button {
+    display: block; width: 100%; text-align: left; padding: 10px 12px; border: none; border-bottom: 1px solid var(--border);
+    background: none; color: var(--text); font-size: 13px; cursor: pointer; overflow-wrap: anywhere;
+  }
+  .folder-list button.selected { background: var(--accent); color: #fff; }
+  .folder-list .running { color: var(--text-dim); font-size: 11px; margin-left: 6px; }
+  .folder-list button.selected .running { color: #eee; }
+  .sheet label { font-size: 12px; color: var(--text-dim); display: block; margin: 10px 0 4px; }
+  .sheet input[type=text] {
+    width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 15px;
+  }
+  .sheet .msg { font-size: 12px; color: var(--text-dim); min-height: 1.4em; margin: 8px 0; overflow-wrap: anywhere; }
+  .sheet .msg.error { color: var(--red-on); }
+  .sheet .job-actions { flex-wrap: wrap; }
+  .toast {
+    position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 20; max-width: calc(100% - 32px);
+    background: var(--titlebar); border: 1px solid var(--border); color: var(--text); border-radius: 8px;
+    padding: 10px 14px; font-size: 13px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+  .toast.error { border-color: var(--red-on); }
+  .icon-btn { font-size: 14px !important; padding: 2px 8px !important; }
+  .icon-btn.on { color: var(--accent) !important; border-color: var(--accent) !important; }
   .bar-wrap { display: flex; align-items: center; gap: 8px; }
   .bar-track {
     flex: 1;
@@ -261,12 +330,6 @@
   }
   .titlebar button:hover { color: var(--text); border-color: var(--accent); }
   .titlebar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .hello { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); cursor: default; }
-  .hello.status-success { color: var(--green); }
-  .hello.status-error { color: var(--red-on); }
-  .switch.mini { width: 30px; height: 16px; }
-  .switch.mini .slider::before { width: 12px; height: 12px; left: 2px; top: 2px; }
-  .switch.mini input:checked + .slider::before { transform: translateX(14px); }
   /* 一覧だけをスクロールさせる(タイトルバー・使用量・見出し・非表示トレイは固定) */
   .panel { display: flex; flex-direction: column; }
   .panel > * { flex-shrink: 0; }
@@ -274,36 +337,6 @@
   /* 初回にウィンドウを内容へ合わせた後(size-locked)だけ高さを画面に収め、はみ出す分を一覧内でスクロールする */
   body.size-locked { height: 100vh; height: 100dvh; }
   body.size-locked #app { min-height: 0; }
-  .switch {
-    position: relative;
-    display: inline-block;
-    width: 46px;
-    height: 26px;
-    flex-shrink: 0;
-  }
-  .switch input { opacity: 0; width: 0; height: 0; }
-  .slider {
-    position: absolute;
-    cursor: pointer;
-    inset: 0;
-    background: var(--track);
-    border-radius: 26px;
-    transition: background 0.2s ease;
-  }
-  .slider::before {
-    content: "";
-    position: absolute;
-    height: 20px;
-    width: 20px;
-    left: 3px;
-    top: 3px;
-    background: var(--text-dim);
-    border-radius: 50%;
-    transition: transform 0.2s ease, background 0.2s ease;
-  }
-  .switch input:checked + .slider { background: var(--accent); }
-  .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
-  .switch input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
 
   /* --- 接続先設定フォーム --- */
   .setup-panel {
@@ -337,6 +370,25 @@
     font-weight: 600;
     cursor: pointer;
   }
+  /* --- スマホ幅: コンテキスト列を名前の下に回し、タップしやすい大きさにする --- */
+  @media (max-width: 600px) {
+    body { padding: 8px; }
+    .panel { border-radius: 8px; }
+    .titlebar { padding: 8px 10px; }
+    .titlebar .title-text { display: none; }
+    .titlebar-actions { gap: 6px; width: 100%; justify-content: flex-end; }
+    .titlebar .addr { display: none; }
+    .header { display: none; }
+    .row { grid-template-columns: minmax(0, 1fr) 28px; row-gap: 6px; padding: 10px; }
+    .row .bar-wrap { grid-column: 1; grid-row: 2; }
+    .row .status { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+    .usage { padding: 8px 10px; column-gap: 6px; grid-template-columns: auto minmax(20px, 1fr) 40px 56px 70px; }
+    .usage .uring, .usage .uh.el { display: none; }  /* 経過リングは幅が足りないので省く */
+  }
+  @media (pointer: coarse) {
+    .uuid-btn, .hide-btn, .term-btn, .end-btn { font-size: 12px; padding: 5px 10px; margin-top: 4px; }
+    .titlebar button { font-size: 13px; padding: 6px 10px; }
+  }
   .setup-panel .error { color: var(--red-on); font-size: 12px; margin: -4px 0 10px; min-height: 1em; }
   [hidden] { display: none !important; }
 </style>
@@ -359,12 +411,13 @@
     <div id="conn-error" class="conn-error" hidden>サーバーに接続できません(起動状態・アドレスを確認してください)</div>
     <div class="panel">
       <div class="titlebar">
-        <span><span class="dot">&#9679;</span>Claude Code Monitor</span>
-        <span class="titlebar-actions"><span class="hello" id="hello" title="毎朝4時(JST) Hello送信">Hello<label class="switch mini"><input type="checkbox" id="kickoff-toggle" disabled><span class="slider"></span></label></span><button id="change-address" type="button">接続先: <span id="current-address"></span> (変更)</button></span>
+        <span class="title-text"><span class="dot">&#9679;</span>Claude Code Monitor</span>
+        <span class="titlebar-actions"><button id="create-open" class="icon-btn" type="button" title="フォルダからセッションを作成">＋</button><button id="notify-toggle" class="icon-btn" type="button" title="作業完了の通知(アプリを開いている間のみ)">&#128276;</button><button id="change-address" type="button">接続先<span class="addr">: <span id="current-address"></span> (変更)</span></button></span>
       </div>
       <div class="usage" id="usage"></div>
+      <div class="jobs" id="jobs" hidden></div>
       <div class="header">
-        <span>SESSION</span><span>CONTEXT USED</span><span style="text-align:right">STATUS</span>
+        <span>SESSION</span><span class="h-context">CONTEXT USED</span><span style="text-align:right">STATUS</span>
       </div>
       <div id="rows"></div>
       <div id="hidden-tray" class="hidden-tray" hidden>
@@ -376,6 +429,19 @@
       </div>
     </div>
   </div>
+
+  <div id="create-sheet" class="sheet-backdrop" hidden>
+    <div class="sheet" role="dialog" aria-label="セッションを作成">
+      <h2><span>フォルダからセッションを作成</span><button id="create-close" type="button" title="閉じる">&#10005;</button></h2>
+      <div class="base-tabs" id="base-tabs"></div>
+      <div class="folder-list" id="folder-list"></div>
+      <label for="create-name">セッション名(半角英数字・「-」「_」)</label>
+      <input id="create-name" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="64">
+      <div class="msg" id="create-msg"></div>
+      <div class="job-actions" id="create-actions"><button class="btn primary" id="create-submit" type="button" disabled>作成</button></div>
+    </div>
+  </div>
+  <div id="toast" class="toast" hidden></div>
 
 <script>
 const STORAGE_KEY = 'claudeMonitorServerAddress';
@@ -614,7 +680,7 @@ function renderRows(limit, sessions) {
     const uuidLabel = revealedUuids.has(s.session_id) ? id : 'UUID';
     return `
       <div class="row">
-        <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button>${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}<span class="cwd">${escapeHtml(s.cwd)}</span></div>
+        <div class="name">${escapeHtml(s.name)}<button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button>${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}${renderEndButton(s)}<span class="cwd">${escapeHtml(s.cwd)}</span></div>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${s.context_pct}%"></div></div>
           <div class="pct-wrap">
@@ -666,6 +732,11 @@ rowsEl.addEventListener('click', (e) => {
     renderRows(lastLimit, lastSessions);
     return;
   }
+  const endBtn = e.target.closest('.end-btn');
+  if (endBtn) {
+    endSession(endBtn.dataset.id);
+    return;
+  }
   const hideBtn = e.target.closest('.hide-btn');
   if (hideBtn) {
     hiddenSessions.add(hideBtn.dataset.id);
@@ -691,6 +762,7 @@ async function refresh() {
     renderRows(lastLimit, lastSessions);
     setConnError(false);
     refreshUsage(false);
+    checkFinishedWork(lastSessions);
   } catch (e) {
     setConnError(true);
   }
@@ -723,7 +795,7 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 function renderUsage() {
   const now = Date.now();
   let html = `<div class="uerr">${lastUsage.error ? escapeHtml(lastUsage.error) : ''}</div>`
-    + '<div class="uh used"><span class="long">SESSION </span>USED</div><div class="uh">ELAPSED</div>'
+    + '<div class="uh used"><span class="long">SESSION </span>USED</div><div class="uh el">ELAPSED</div>'
     + '<div class="uh">RESETS IN</div><div class="uh">RESETS AT</div>';
   for (const [key, label, short, color] of USAGE_ROWS) {
     const item = lastUsage[key];
@@ -763,57 +835,387 @@ async function refreshUsage(force) {
   renderUsage();
 }
 
-const STATUS_LABELS = { success: '成功', error: 'エラー', skipped: 'スキップ' };
-const kickoffToggle = document.getElementById('kickoff-toggle');
-const helloEl = document.getElementById('hello');
-let kickoffSyncing = false;
+// ---------------------------------------------------------------------------
+// 操作(＋作成・終了・信頼確認)。処理はサーバー側のジョブで動くので、アプリを閉じても止まらない。
+// 開き直すと /api/jobs から実行中・直近の操作を取り直して表示する。
+// ---------------------------------------------------------------------------
+const SESSION_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const TMUX_ATTACH_RE = /^tmux attach -t =([A-Za-z0-9_-]{1,64})$/;
+const DISMISSED_JOBS_KEY = 'claudeMonitorDismissedJobs';
+const CREATE_BASE_KEY = 'claudeMonitorCreateBase';
+const jobsEl = document.getElementById('jobs');
+const toastEl = document.getElementById('toast');
+let jobs = [];
+let toastTimer = null;
 
-function formatLocal(iso) {
-  if (!iso) return '(まだ実行なし)';
-  return new Date(iso).toLocaleString('ja-JP');
+function showToast(text, isError) {
+  toastEl.textContent = text;
+  toastEl.className = 'toast' + (isError ? ' error' : '');
+  toastEl.hidden = false;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.hidden = true; }, isError ? 6000 : 3000);
+}
+function loadDismissedJobs() {
+  try { const v = JSON.parse(localStorage.getItem(DISMISSED_JOBS_KEY) || '[]'); return new Set(Array.isArray(v) ? v : []); }
+  catch (e) { return new Set(); }
+}
+const dismissedJobs = loadDismissedJobs();
+function saveDismissedJobs() {
+  // サーバーは完了後10分で操作を忘れるので、ここも直近の分だけ持てば足りる
+  try { localStorage.setItem(DISMISSED_JOBS_KEY, JSON.stringify([...dismissedJobs].slice(-50))); } catch (e) { /* ignore */ }
 }
 
-function renderKickoff(state) {
-  kickoffToggle.checked = !!state.enabled;
-  kickoffToggle.disabled = false;
-  const statusLabel = state.last_status ? (STATUS_LABELS[state.last_status] || state.last_status) : '-';
-  helloEl.className = 'hello' + (state.last_status ? ` status-${state.last_status}` : '');
-  helloEl.title = `毎朝4時(JST) Hello送信: ${state.enabled ? '有効' : '無効'}\n`
-    + `次回実行(予定): ${state.next_run_local || '-'}\n前回実行: ${formatLocal(state.last_run)} ${statusLabel}`;
-  fitWindowToContent();
-}
-
-async function refreshKickoff() {
-  if (kickoffSyncing) return;
+// POSTしてJSONを返す。失敗はサーバーのエラー文言でthrowする。
+async function apiPost(path, body) {
+  let res;
   try {
-    const res = await apiFetch(baseUrl + '/api/kickoff', { cache: 'no-store' });
-    if (!res.ok) throw new Error('kickoff status unavailable');
-    renderKickoff(await res.json());
+    res = await apiFetch(baseUrl + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+    });
   } catch (e) {
-    helloEl.className = 'hello';
-    helloEl.title = '状態を取得できません(daily_kickoff.py 未検出、またはサーバーに接続できません)';
+    throw new Error('サーバーに接続できません');
+  }
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = {}; }
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function activeJobFor(name) {
+  return jobs.find(j => !j.done && j.name === name);
+}
+function renderEndButton(s) {
+  const m = TMUX_ATTACH_RE.exec(s.attach_cmd || '');
+  if (!m) return '';  // 終了はtmuxのセッションだけ(claude attach のbgは対象外)
+  const busy = activeJobFor(m[1]);
+  return `<button type="button" class="end-btn" data-id="${escapeHtml(s.session_id)}" ${busy ? 'disabled' : ''}>${busy ? '終了中…' : '終了'}</button>`;
+}
+
+async function endSession(sessionId) {
+  const s = lastSessions.find(x => x.session_id === sessionId);
+  if (!s) return;
+  if (s.working) { showToast(`'${s.name}' は作業中です。待機中(緑)になってから押してください`, true); return; }
+  // コンテキスト0(会話が無い)なら /session-end を送らず削除するだけなので、確認しない
+  if (s.context_tokens !== 0 && !confirm(`'${s.name}' に /session-end を送り、完了したらセッションを削除します。\n(会話履歴は残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?`)) return;
+  try {
+    const data = await apiPost('/api/end', { session_id: sessionId });
+    upsertJob(data.job);
+    showToast(`'${s.name}' の終了処理を始めました`);
+  } catch (e) {
+    showToast(`終了できません: ${e.message}`, true);
   }
 }
 
-kickoffToggle.addEventListener('change', async () => {
-  kickoffSyncing = true;
-  const enabled = kickoffToggle.checked;
-  kickoffToggle.disabled = true;
+function upsertJob(job) {
+  const i = jobs.findIndex(j => j.id === job.id);
+  if (i >= 0) jobs[i] = job; else jobs.push(job);
+  renderJobs();
+  renderRows(lastLimit, lastSessions);
+}
+
+const notifiedJobs = new Set();
+async function refreshJobs() {
+  if (!baseUrl) return;
   try {
-    const res = await apiFetch(baseUrl + '/api/kickoff/toggle', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled }),
-    });
-    if (!res.ok) throw new Error('toggle failed');
-    renderKickoff(await res.json());
-  } catch (e) {
-    kickoffToggle.checked = !enabled;
-    kickoffToggle.disabled = false;
-  } finally {
-    kickoffSyncing = false;
+    const res = await apiFetch(baseUrl + '/api/jobs', { cache: 'no-store' });
+    if (!res.ok) return;  // 古いサーバー(このAPIが無い)では何もしない
+    const data = await res.json();
+    const before = new Map(jobs.map(j => [j.id, j]));
+    jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    for (const j of jobs) {
+      const prev = before.get(j.id);
+      // 見ている間に状態が変わったものだけ通知する(開き直した直後の一覧で鳴らさない)
+      if (prev && !prev.done && j.done && !notifiedJobs.has(j.id + ':done')) {
+        notifiedJobs.add(j.id + ':done');
+        notify(j.error ? `${j.name}: 失敗` : `${j.name}: 完了`, j.error || j.message, 'job-' + j.id);
+      }
+      if (prev && prev.stage !== 'trust' && j.stage === 'trust' && !notifiedJobs.has(j.id + ':trust')) {
+        notifiedJobs.add(j.id + ':trust');
+        notify(`${j.name}: 信頼確認の回答待ち`, 'アプリを開いて答えてください', 'job-' + j.id);
+      }
+    }
+    renderJobs();
+  } catch (e) { /* 接続エラーは一覧側で表示する */ }
+}
+
+function renderJobs() {
+  const shown = jobs.filter(j => !dismissedJobs.has(j.id));
+  jobsEl.hidden = shown.length === 0;
+  jobsEl.innerHTML = shown.map(j => {
+    const id = escapeHtml(j.id);
+    const kind = j.kind === 'create' ? '作成' : '終了';
+    const text = j.done ? (j.error ? `失敗: ${j.error}` : (j.message || '完了')) : `${j.stage_label}…`;
+    let html = `<div class="job ${j.done ? (j.error ? 'error' : 'done') : ''}"><div class="job-head">`
+      + `<span class="job-text"><b>${escapeHtml(j.name)}</b>(${kind}): ${escapeHtml(text)}</span>`
+      + (j.done ? `<button type="button" class="job-dismiss" data-id="${id}" title="閉じる">&#10005;</button>` : '')
+      + '</div>';
+    if (j.stage === 'trust') {
+      html += `<pre>${escapeHtml((j.trust_pane || []).join('\n'))}</pre>`
+        + '<div class="job-actions">'
+        + `<button type="button" class="btn primary trust-btn" data-id="${id}" data-approve="1">信頼する</button>`
+        + `<button type="button" class="btn trust-btn" data-id="${id}" data-approve="0">やめる(削除)</button></div>`;
+    }
+    return html + '</div>';
+  }).join('');
+}
+
+jobsEl.addEventListener('click', async (e) => {
+  const dismiss = e.target.closest('.job-dismiss');
+  if (dismiss) {
+    dismissedJobs.add(dismiss.dataset.id);
+    saveDismissedJobs();
+    renderJobs();
+    return;
+  }
+  const btn = e.target.closest('.trust-btn');
+  if (!btn) return;
+  const approve = btn.dataset.approve === '1';
+  const job = jobs.find(j => j.id === btn.dataset.id);
+  if (!approve && !confirm(`'${job ? job.name : ''}' を信頼せず、セッションを削除します。よろしいですか?`)) return;
+  for (const b of jobsEl.querySelectorAll('.trust-btn')) b.disabled = true;
+  try {
+    const data = await apiPost(`/api/jobs/${encodeURIComponent(btn.dataset.id)}/trust`, { approve });
+    upsertJob(data.job);
+  } catch (err) {
+    showToast(err.message, true);
+    renderJobs();
   }
 });
+
+// --- ＋: フォルダを選んでセッションを作成 ---
+const createSheet = document.getElementById('create-sheet');
+const baseTabsEl = document.getElementById('base-tabs');
+const folderListEl = document.getElementById('folder-list');
+const createNameEl = document.getElementById('create-name');
+const createMsgEl = document.getElementById('create-msg');
+const createActionsEl = document.getElementById('create-actions');
+let createBases = [];
+let createBase = '';
+let createFolders = null;   // null=取得中
+let createFolder = null;    // 選択中(''=作成元フォルダ自体)
+let createBusy = false;
+let listSeq = 0;
+
+function setCreateMsg(text, isError) {
+  createMsgEl.textContent = text || '';
+  createMsgEl.className = 'msg' + (isError ? ' error' : '');
+}
+function baseName(path) { return path.replace(/\/+$/, '').split('/').pop(); }
+function folderPath(folder) { return folder === '' ? createBase : createBase + '/' + folder; }
+function runningNames() { return new Set(lastSessions.map(s => s.name)); }
+
+function createBlockedReason() {
+  const name = createNameEl.value.trim();
+  if (createFolder === null) return 'フォルダを選んでください';
+  if (!name) return 'セッション名を入力してください(半角英数字・「-」「_」、先頭は英数字、64文字以内)';
+  if (!SESSION_NAME_RE.test(name)) return 'セッション名に使えるのは半角英数字・「-」「_」のみです(先頭は英数字、64文字以内)';
+  if (runningNames().has(name)) return `'${name}' という名前のセッションが既に起動しています`;
+  return '';
+}
+function resetCreateActions() {
+  createActionsEl.innerHTML = '<button class="btn primary" id="create-submit" type="button">作成</button>';
+}
+function refreshCreateState() {
+  if (createBusy) return;
+  const btn = document.getElementById('create-submit');
+  const reason = createBlockedReason();
+  if (btn) btn.disabled = !!reason;
+  if (createFolders === null) return;
+  setCreateMsg(reason || `場所: ${folderPath(createFolder)}`, !!reason && createFolder !== null);
+}
+
+function renderBaseTabs() {
+  baseTabsEl.innerHTML = createBases.map(b =>
+    `<button type="button" data-path="${escapeHtml(b.path)}" class="${b.path === createBase ? 'active' : ''}">${escapeHtml(b.label)}</button>`).join('');
+}
+function renderFolderList() {
+  if (createFolders === null) { folderListEl.innerHTML = ''; return; }
+  const running = runningNames();
+  const items = ['', ...createFolders];
+  folderListEl.innerHTML = items.map(f => {
+    const label = f === '' ? `(このフォルダ自体: ${baseName(createBase)})` : f;
+    const name = f === '' ? baseName(createBase) : f;
+    return `<button type="button" data-folder="${escapeHtml(f)}" class="${f === createFolder ? 'selected' : ''}">${escapeHtml(label)}${running.has(name) ? '<span class="running">(起動中)</span>' : ''}</button>`;
+  }).join('');
+}
+
+async function loadFolders() {
+  const seq = ++listSeq;
+  createFolders = null;
+  createFolder = null;
+  createNameEl.value = '';
+  renderFolderList();
+  resetCreateActions();
+  refreshCreateState();
+  setCreateMsg('フォルダ一覧を取得中...');
+  try {
+    const data = await apiPost('/api/create/listdir', { base: createBase });
+    if (seq !== listSeq) return;
+    createFolders = Array.isArray(data.folders) ? data.folders : [];
+    renderFolderList();
+    setCreateMsg('フォルダを選び、セッション名を確認して「作成」を押してください');
+  } catch (e) {
+    if (seq !== listSeq) return;
+    createFolders = [];
+    renderFolderList();
+    setCreateMsg(e.message, true);
+  }
+}
+
+async function openCreateSheet() {
+  createSheet.hidden = false;
+  createBusy = false;
+  if (createBases.length === 0) {
+    setCreateMsg('作成元を取得中...');
+    try {
+      const res = await apiFetch(baseUrl + '/api/create/bases', { cache: 'no-store' });
+      if (!res.ok) throw new Error(res.status === 404 ? 'サーバーが古いため作成できません(サーバーを更新してください)' : `HTTP ${res.status}`);
+      createBases = (await res.json()).bases || [];
+    } catch (e) {
+      setCreateMsg(e.message || 'サーバーに接続できません', true);
+      return;
+    }
+  }
+  let saved = '';
+  try { saved = localStorage.getItem(CREATE_BASE_KEY) || ''; } catch (e) { /* ignore */ }
+  createBase = createBases.some(b => b.path === saved) ? saved : (createBases[0] || {}).path || '';
+  renderBaseTabs();
+  loadFolders();
+}
+function closeCreateSheet() {
+  createSheet.hidden = true;
+  listSeq++;
+}
+
+baseTabsEl.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b || createBusy || b.dataset.path === createBase) return;
+  createBase = b.dataset.path;
+  try { localStorage.setItem(CREATE_BASE_KEY, createBase); } catch (err) { /* ignore */ }
+  renderBaseTabs();
+  loadFolders();
+});
+folderListEl.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b || createBusy) return;
+  createFolder = b.dataset.folder;
+  // セッション名の初期値はフォルダ名(名前に使えない文字なら空欄にして入力を促す)
+  const def = baseName(folderPath(createFolder));
+  createNameEl.value = SESSION_NAME_RE.test(def) ? def : '';
+  resetCreateActions();
+  renderFolderList();
+  refreshCreateState();
+  if (!createNameEl.value) createNameEl.focus();
+});
+createNameEl.addEventListener('input', () => { resetCreateActions(); refreshCreateState(); });
+document.getElementById('create-close').addEventListener('click', closeCreateSheet);
+createSheet.addEventListener('click', (e) => { if (e.target === createSheet) closeCreateSheet(); });
+document.getElementById('create-open').addEventListener('click', openCreateSheet);
+
+async function submitCreate(init) {
+  const name = createNameEl.value.trim();
+  createBusy = true;
+  for (const b of createActionsEl.querySelectorAll('button')) b.disabled = true;
+  setCreateMsg('作成を依頼中...');
+  try {
+    const data = await apiPost('/api/create', { base: createBase, folder: createFolder, name, init });
+    upsertJob(data.job);
+    closeCreateSheet();
+    showToast(`'${name}' を作成中です(信頼確認が出たら一覧の上で答えてください)`);
+  } catch (e) {
+    createBusy = false;
+    resetCreateActions();
+    refreshCreateState();
+    setCreateMsg(e.message, true);
+  }
+}
+
+createActionsEl.addEventListener('click', async (e) => {
+  const b = e.target.closest('button');
+  if (!b || b.disabled) return;
+  if (b.id === 'create-submit') {
+    if (createBlockedReason() || createBusy) return;
+    createBusy = true;
+    b.disabled = true;
+    setCreateMsg('フォルダの中身を確認中...');
+    let md = null;
+    try {
+      md = (await apiPost('/api/create/md_status', { base: createBase, folder: createFolder })).md;
+    } catch (err) {
+      createBusy = false;
+      refreshCreateState();
+      setCreateMsg(err.message, true);
+      return;
+    }
+    createBusy = false;
+    if (md && Object.values(md).some(Boolean)) { submitCreate(false); return; }
+    // 引き継ぎmdが1つも無い: プロジェクトフォルダではない可能性(GUIと同じ3択)
+    const names = md && Object.keys(md).length ? Object.keys(md).join('・') : '引き継ぎ用md';
+    setCreateMsg(`'${baseName(folderPath(createFolder))}' には ${names} が1つもありません。プロジェクトフォルダではない可能性があります。`, true);
+    createActionsEl.innerHTML = '<button class="btn primary" data-init="1" type="button">作成して /project-init</button>'
+      + '<button class="btn" data-init="0" type="button">作成のみ</button>'
+      + '<button class="btn" data-cancel="1" type="button">キャンセル</button>';
+    return;
+  }
+  if (b.dataset.cancel) { resetCreateActions(); refreshCreateState(); return; }
+  if (b.dataset.init) submitCreate(b.dataset.init === '1');
+});
+
+// --- 作業完了の通知(アプリを開いている間のみ。閉じている・画面が消えている間は届かない) ---
+const NOTIFY_KEY = 'claudeMonitorNotify';
+const IDLE_NOTIFY_SEC = 10;  // 待機中がこの秒数続いたら完了とみなす(サーバーの終了判定と同じ)
+const notifyBtn = document.getElementById('notify-toggle');
+const prevWorking = new Map();  // session_id -> 直前のworking
+const idleSince = new Map();    // session_id -> 作業中→待機になった時刻(通知待ち)
+function notifyEnabled() {
+  try { return localStorage.getItem(NOTIFY_KEY) === '1' && 'Notification' in window && Notification.permission === 'granted'; }
+  catch (e) { return false; }
+}
+function renderNotifyBtn() {
+  const on = notifyEnabled();
+  notifyBtn.classList.toggle('on', on);
+  notifyBtn.title = on ? '作業完了の通知: オン(アプリを開いている間のみ)' : '作業完了の通知: オフ';
+}
+notifyBtn.addEventListener('click', async () => {
+  if (!('Notification' in window) || !('serviceWorker' in navigator)) { showToast('この端末では通知を使えません', true); return; }
+  if (notifyEnabled()) {
+    try { localStorage.setItem(NOTIFY_KEY, '0'); } catch (e) { /* ignore */ }
+    renderNotifyBtn();
+    showToast('通知をオフにしました');
+    return;
+  }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { showToast('通知が許可されていません(端末の設定で許可してください)', true); return; }
+  try { localStorage.setItem(NOTIFY_KEY, '1'); } catch (e) { /* ignore */ }
+  renderNotifyBtn();
+  showToast('通知をオンにしました(アプリを開いている間のみ届きます)');
+});
+async function notify(title, body, tag) {
+  // 画面を見ている間は通知しない(ランプで分かるため)
+  if (!notifyEnabled() || document.visibilityState === 'visible') return;
+  try {
+    const reg = await navigator.serviceWorker.ready;  // Androidは new Notification() が使えずSW経由が必須
+    await reg.showNotification(title, { body: body || '', tag, icon: 'icon-192.png', badge: 'icon-192.png' });
+  } catch (e) { /* ignore */ }
+}
+function checkFinishedWork(sessions) {
+  const now = Date.now();
+  const live = new Set();
+  for (const s of sessions) {
+    live.add(s.session_id);
+    const was = prevWorking.get(s.session_id);
+    if (s.working) idleSince.delete(s.session_id);
+    else if (was === true) idleSince.set(s.session_id, now);  // 作業中→待機(初回の取得では鳴らさない)
+    prevWorking.set(s.session_id, s.working);
+    const t = idleSince.get(s.session_id);
+    if (t !== undefined && !s.working && now - t >= IDLE_NOTIFY_SEC * 1000) {
+      idleSince.delete(s.session_id);
+      notify(`${s.name}: 作業が終わりました`, s.cwd, 'session-' + s.session_id);
+    }
+  }
+  for (const id of [...prevWorking.keys()]) if (!live.has(id)) { prevWorking.delete(id); idleSince.delete(id); }
+}
+renderNotifyBtn();
 
 function startApp(url) {
   baseUrl = url;
@@ -823,18 +1225,20 @@ function startApp(url) {
   lastFitHeight = 0;
   appSizeLocked = false; document.body.classList.remove('size-locked');
   lastUsage = {};
-  Promise.all([refresh(), refreshKickoff(), refreshUsage(true)]).then(() => {
+  Promise.all([refresh(), refreshUsage(true)]).then(() => {
     // 初回表示のレイアウトが確定した後にサイズを固定する
     setTimeout(() => { appSizeLocked = true; document.body.classList.add('size-locked'); }, 300);
   });
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => { refresh(); refreshKickoff(); }, POLL_INTERVAL_MS);
+  jobs = []; prevWorking.clear(); idleSince.clear();
+  refreshJobs();
+  pollTimer = setInterval(() => { refresh(); refreshJobs(); }, POLL_INTERVAL_MS);
 }
 
 // タブ/ウィンドウが非表示の間はブラウザがsetIntervalを大幅に間引くため、
 // 表示状態に戻ったタイミングで即座に再取得して古い表示のまま放置しない。
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); refreshUsage(false); }
+  if (!document.hidden && baseUrl) { refresh(); refreshUsage(false); refreshJobs(); }
 });
 
 // 初期化: 保存済みアドレスがあれば自動接続、なければ入力フォームを表示

@@ -155,6 +155,26 @@ Published URL: `https://<your GitHub username>.github.io/claude-code-monitor/`
 3. On every later launch this device automatically connects to the saved
    address. To change it, use "Address: ... (change)" in the top right.
 
+### Using it on Android (phone layout, create/end sessions)
+Open the URL in Chrome on Android and choose "Add to Home screen" (or "Install
+app"). On narrow screens the context bar moves under the session name. The
+shell can also do what the desktop GUI's remote mode does, without ssh on the
+phone: the server runs `claude-session-ctl` itself.
+- **＋**: pick a base folder and a folder (or "this folder itself"), set the
+  session name, and create the session. If the folder has none of the handoff
+  files, you can choose "create and run `/project-init`" or "create only".
+- **Trust prompt**: when Claude asks whether to trust a new folder, the screen
+  text appears at the top of the list with "Trust" / "Cancel (delete)". The
+  server never answers on its own: it moves the cursor to "Yes, I trust this
+  folder", checks the screen, and only then sends Enter.
+- **End**: sends `/session-end`, waits for it to finish, then stops the
+  session (tmux sessions only; sessions with no conversation are just stopped).
+- Creating and ending run as server-side jobs, so they keep going after you
+  close the app (`/api/jobs` shows the progress).
+- **🔔**: notifies you when a session goes from working to idle. It only works
+  while the app is open; Android stops background pages, so nothing arrives
+  once the app is closed or the screen is off.
+
 ### Server-side prerequisite (CORS)
 Since `docs/index.html` fetches the server's `/api/sessions` etc. from a
 different origin (GitHub Pages), `claude_monitor_web.py` sends

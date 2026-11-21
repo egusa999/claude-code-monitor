@@ -22,10 +22,14 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import logging
+import posixpath
 import ssl
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -771,6 +775,233 @@ def _kickoff_state_payload() -> dict:
     return state
 
 
+# ---------------------------------------------------------------------------
+# PWA(Android等)からの操作: ＋(フォルダからセッション作成)・終了・信頼確認の承認
+# GUIはsshでclaude-session-ctlを呼ぶが、ここではサーバー内で直接呼ぶ。長い処理はスマホを閉じても
+# 止まらないようサーバー側のジョブ(スレッド)で実行し、PWAは /api/jobs をポーリングして表示する。
+# ---------------------------------------------------------------------------
+
+MAX_BODY_BYTES = 16 * 1024        # POST本文の上限
+JOB_KEEP_SEC = 10 * 60.0          # 完了したジョブを状態確認用に残す時間
+MAX_ACTIVE_JOBS = 8               # 同時に実行できるジョブ数
+TRUST_PANE_LINES = 25             # 信頼確認の画面としてPWAに見せる末尾の行数
+STAGE_LABELS = {
+    "starting": "セッションを起動中",
+    "checking": "信頼確認の画面を確認中",
+    "trust": "信頼確認の回答待ち",
+    "init": f"{claude_monitor.INIT_COMMAND} を実行中",
+    "ending": f"{claude_monitor.SESSION_END_COMMAND} を実行中",
+    "done": "完了",
+    "error": "失敗",
+}
+
+
+class ApiError(Exception):
+    """利用者に見せるエラー(HTTPステータス付き)。"""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class Job:
+    def __init__(self, kind: str, name: str):
+        self.id = uuid.uuid4().hex
+        self.kind = kind
+        self.name = name
+        self.stage = "starting" if kind == "create" else "ending"
+        self.error = ""
+        self.message = ""
+        self.trust_pane: list[str] = []
+        self.finished_at: float | None = None
+        self.trust_answered = threading.Event()
+        self.trust_rejected = False
+
+    @property
+    def done(self) -> bool:
+        return self.finished_at is not None
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "name": self.name, "stage": self.stage,
+                "stage_label": STAGE_LABELS.get(self.stage, self.stage), "done": self.done,
+                "error": self.error, "message": self.message,
+                "trust_pane": self.trust_pane if self.stage == "trust" else []}
+
+
+class ActionJobs:
+    """作成・終了ジョブの管理。ctl(cmd, **params) と sessions() は差し替え可能(テスト用)。"""
+
+    def __init__(self, ctl=claude_monitor.call_session_ctl_local, sessions=get_sessions,
+                 sleep=time.sleep, clock=time.monotonic, spawn=None):
+        self._ctl = ctl
+        self._sessions = sessions
+        self._sleep = sleep
+        self._clock = clock
+        self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self._jobs: dict[str, Job] = {}
+        self._lock = threading.Lock()
+
+    # --- 登録・参照 ---
+    def _purge(self) -> None:
+        now = self._clock()
+        for jid in [j.id for j in self._jobs.values() if j.done and now - j.finished_at > JOB_KEEP_SEC]:
+            del self._jobs[jid]
+
+    def _register(self, kind: str, name: str) -> Job:
+        with self._lock:
+            self._purge()
+            active = [j for j in self._jobs.values() if not j.done]
+            if any(j.name == name for j in active):
+                raise ApiError(409, f"'{name}' は別の操作を実行中です")
+            if len(active) >= MAX_ACTIVE_JOBS:
+                raise ApiError(429, "実行中の操作が多すぎます。しばらく待ってください")
+            job = Job(kind, name)
+            self._jobs[job.id] = job
+            return job
+
+    def get(self, job_id: str) -> Job:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            raise ApiError(404, "操作が見つかりません(完了から時間が経って消えた可能性があります)")
+        return job
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            self._purge()
+            return [j.to_dict() for j in self._jobs.values()]
+
+    def _finish(self, job: Job, error: str = "", message: str = "") -> None:
+        job.error, job.message = error, message
+        job.stage = "error" if error else "done"
+        job.finished_at = self._clock()
+        (logging.warning if error else logging.info)("job %s '%s' %s: %s", job.kind, job.name, job.stage,
+                                                      error or message)
+
+    def _run(self, job: Job, work) -> None:
+        def target() -> None:
+            try:
+                work()
+            except claude_monitor.SessionCtlError as e:
+                self._finish(job, error=str(e))
+            except Exception as e:  # noqa: BLE001 ジョブの例外でサーバーを止めない
+                logging.exception("job %s '%s' crashed", job.kind, job.name)
+                self._finish(job, error=f"内部エラー: {e}")
+        self._spawn(target)
+
+    # --- 作成 ---
+    def create(self, base: str, folder: str, name: str, init: bool) -> Job:
+        path = resolve_folder(base, folder)
+        name = validate_session_name(name)
+        job = self._register("create", name)
+        logging.info("create session (PWA): name=%s dir=%s init=%s", name, path, init)
+        self._run(job, lambda: self._create_work(job, path, init))
+        return job
+
+    def _create_work(self, job: Job, path: str, init: bool) -> None:
+        ctl, name = self._ctl, job.name
+        try:
+            ctl(claude_monitor.SESSION_CTL_START, name=name, dir=path)
+        except claude_monitor.SessionCtlError as e:
+            # 信頼確認で止まったままの残骸なら作り直さずに続きから再開する(GUIと同じ)
+            if claude_monitor.SESSION_IN_USE_MARKER not in str(e):
+                raise
+            job.stage = "checking"
+            if not claude_monitor.wait_for_trust_prompt(name, ctl, self._sleep, self._clock):
+                raise
+            logging.info("'%s': resuming a session waiting at the trust prompt", name)
+        job.stage = "checking"
+        if claude_monitor.wait_for_trust_prompt(name, ctl, self._sleep, self._clock):
+            job.trust_pane = claude_monitor.pane_plain_lines(
+                str(ctl(claude_monitor.SESSION_CTL_CAPTURE, name=name)))[-TRUST_PANE_LINES:]
+            job.stage = "trust"
+            if not job.trust_answered.wait(claude_monitor.INIT_READY_TIMEOUT_SEC):
+                raise claude_monitor.SessionCtlError("信頼確認に時間内の回答がありませんでした(セッションは残っています)")
+            if job.trust_rejected:
+                self._finish(job, message="信頼しなかったのでセッションを削除しました")
+                return
+        if init:
+            job.stage = "init"
+            marker = f"tmux attach -t ={name}"
+
+            def find_session():
+                return next((s for s in self._sessions() if s.attach_cmd == marker), None)
+
+            claude_monitor.init_project_workflow(name, ctl, find_session, self._sleep, self._clock)
+        self._finish(job, message=f"'{name}' を作成しました")
+
+    def answer_trust(self, job_id: str, approve: bool) -> Job:
+        """本人が信頼確認に答えた。承認ならカーソルがYes上と確認してからEnter(できなければ400、何も送らない)。"""
+        job = self.get(job_id)
+        if job.stage != "trust" or job.trust_answered.is_set():
+            raise ApiError(409, "信頼確認の回答待ちではありません")
+        if approve:
+            try:
+                claude_monitor.approve_trust(job.name, self._ctl, self._sleep)
+            except claude_monitor.SessionCtlError as e:
+                raise ApiError(400, str(e)) from None
+        else:
+            try:
+                self._ctl(claude_monitor.SESSION_CTL_STOP, name=job.name)
+            except claude_monitor.SessionCtlError as e:
+                raise ApiError(400, str(e)) from None
+            job.trust_rejected = True
+        job.stage = "checking"
+        job.trust_answered.set()
+        return job
+
+    # --- 終了 ---
+    def end(self, session_id: str) -> Job:
+        info = next((s for s in self._sessions() if s.session_id == session_id), None)
+        if info is None:
+            raise ApiError(404, "セッションが一覧に見つかりません")
+        m = claude_monitor.TMUX_ATTACH_PATTERN.match(info.attach_cmd)
+        if not m:
+            raise ApiError(400, "tmuxで動いているセッションだけ終了できます")
+        if info.working:
+            raise ApiError(409, "作業中です。待機中(緑)になってから押してください")
+        name = m.group(1)
+        job = self._register("end", name)
+        logging.info("end session (PWA): name=%s id=%s", name, session_id)
+
+        def get_session(sid: str):
+            return next((s for s in self._sessions() if s.session_id == sid), None)
+
+        def work() -> None:
+            claude_monitor.end_session_workflow(name, session_id, self._ctl, get_session, self._sleep, self._clock)
+            self._finish(job, message=f"'{name}' を終了しました")
+        self._run(job, work)
+        return job
+
+
+def validate_session_name(name) -> str:
+    if not isinstance(name, str) or not claude_monitor.SESSION_NAME_PATTERN.match(name.strip()):
+        raise ApiError(400, "セッション名に使えるのは半角英数字・「-」「_」のみです(先頭は英数字、64文字以内)")
+    return name.strip()
+
+
+def validate_base(base) -> str:
+    if base not in claude_monitor.DEFAULT_CREATE_BASES:
+        raise ApiError(400, "作成元フォルダが不正です")
+    return base
+
+
+def resolve_folder(base, folder) -> str:
+    """作成元+フォルダ名からフルパスを作る。folderが空なら作成元自体。区切り文字・「..」は拒否。"""
+    base = validate_base(base)
+    if folder is None:
+        folder = claude_monitor.BASE_ITSELF
+    if not isinstance(folder, str) or "/" in folder or "\\" in folder or "\0" in folder or folder in (".", ".."):
+        raise ApiError(400, "フォルダ名が不正です")
+    return base if folder == claude_monitor.BASE_ITSELF else posixpath.join(base, folder)
+
+
+def bases_payload() -> dict:
+    bases = list(claude_monitor.DEFAULT_CREATE_BASES)
+    return {"bases": [{"path": b, "label": label} for b, label in zip(bases, claude_monitor.base_labels(bases))],
+            "itself": claude_monitor.BASE_ITSELF}
+
+
 def load_token(path: str) -> str | None:
     """トークンファイルを読む。無ければNone。短すぎる/空のトークンはValueError。"""
     file = Path(path)
@@ -817,6 +1048,7 @@ class MonitorServer(ThreadingHTTPServer):
 class MonitorHandler(BaseHTTPRequestHandler):
     timeout = REQUEST_TIMEOUT_SEC  # 無送信のまま居座る接続を切る(StreamRequestHandler.setupが適用)
     token: str | None = None  # Noneなら認証なし(ループバック待受のときのみ許可。main()で検証)
+    jobs = ActionJobs()  # PWAからの作成・終了ジョブ(サーバー全体で1つ)
 
     def _authorized(self) -> bool:
         if self.token is None:
@@ -859,6 +1091,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
             status = 503 if set(payload) == {"error"} else 200
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send(status, body, "application/json; charset=utf-8", cors=True)
+        elif self.path == "/api/create/bases":
+            self._send_json(200, bases_payload())
+        elif self.path == "/api/jobs":
+            self._send_json(200, {"jobs": self.jobs.list()})
+        elif self.path.startswith("/api/jobs/"):
+            self._handle_api(lambda: {"job": self.jobs.get(self.path[len("/api/jobs/"):]).to_dict()})
         elif self.path == "/manifest.json":
             self._send(200, MANIFEST_JSON, "application/manifest+json; charset=utf-8")
         elif self.path == "/icon.svg":
@@ -886,8 +1124,61 @@ class MonitorHandler(BaseHTTPRequestHandler):
             daily_kickoff.set_enabled(enabled)
             body = json.dumps(_kickoff_state_payload(), ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8", cors=True)
+        elif self.path in self.ACTION_ROUTES or (self.path.startswith("/api/jobs/") and self.path.endswith("/trust")):
+            self._handle_api(lambda: self._action(self._read_json()))
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    ACTION_ROUTES = ("/api/create/listdir", "/api/create/md_status", "/api/create", "/api/end")
+
+    def _action(self, body: dict) -> dict:
+        ctl = self.jobs._ctl
+        if self.path == "/api/create/listdir":
+            result = ctl(claude_monitor.SESSION_CTL_LISTDIR, base=validate_base(body.get("base")))
+            return {"folders": [f for f in result if isinstance(f, str) and f] if isinstance(result, list) else []}
+        if self.path == "/api/create/md_status":
+            result = ctl(claude_monitor.SESSION_CTL_MD_STATUS, dir=resolve_folder(body.get("base"), body.get("folder")))
+            return {"md": result if isinstance(result, dict) else {}}
+        if self.path == "/api/create":
+            return {"job": self.jobs.create(body.get("base"), body.get("folder"), body.get("name"),
+                                            bool(body.get("init"))).to_dict()}
+        if self.path == "/api/end":
+            sid = body.get("session_id")
+            if not isinstance(sid, str) or not sid:
+                raise ApiError(400, "session_id がありません")
+            return {"job": self.jobs.end(sid).to_dict()}
+        job_id = self.path[len("/api/jobs/"):-len("/trust")]
+        return {"job": self.jobs.answer_trust(job_id, body.get("approve") is True).to_dict()}
+
+    def _read_json(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            raise ApiError(400, "Content-Length が不正です") from None
+        if length < 0 or length > MAX_BODY_BYTES:
+            raise ApiError(413, "リクエストが大きすぎます")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ApiError(400, "JSONが不正です") from None
+        if not isinstance(body, dict):
+            raise ApiError(400, "JSONオブジェクトを送ってください")
+        return body
+
+    def _handle_api(self, fn) -> None:
+        try:
+            payload = fn()
+        except ApiError as e:
+            self._send_json(e.status, {"error": str(e)})
+        except claude_monitor.SessionCtlError as e:
+            self._send_json(400, {"error": str(e)})
+        else:
+            self._send_json(200, payload)
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8", cors=True)
 
     def do_OPTIONS(self) -> None:
         # ブラウザのCORSプリフライト(POST /api/kickoff/toggle 用)に応答する。
@@ -934,6 +1225,7 @@ def main() -> None:
                               "CLAUDE_CONTEXT_TOKEN_LIMIT、未設定なら1,000,000)。"
                               "/context の表示(例: '96.6k / 1m')の右側の数字に合わせる")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")  # journalに残る
 
     if args.context_limit is not None:
         claude_monitor.CONTEXT_TOKEN_LIMIT = args.context_limit
