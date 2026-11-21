@@ -153,18 +153,18 @@ APP_USER_MODEL_ID = "ClaudeCodeMonitor.GUI"  # タスクバーでpythonwとは�
 # 枠なし(overrideredirect)のウィンドウはWS_POPUP=ポップアップ扱いでFancyZonesに無視されるため、WS_POPUPだけ外す
 # (枠・タイトルバーは付かない)。移動はタイトルバーのドラッグをOS標準の移動(WM_NCLBUTTONDOWN/HTCAPTION)にして
 # FancyZonesに検知させる。サイズ変更枠(WS_THICKFRAME)+WM_NCCALCSIZEのフックは実機で太い枠が出たので使わない。
-# ただしこのKeep風の版はWindows実機でエクスプローラーの暴走→アプリのクラッシュを起こした(2026-11-22、原因未特定)ため、
-# 既定ではWindows標準のタイトルバー(DWMでアプリの色に塗る。実機で動作確認済み)を使い、
-# Keep風は環境変数 CLAUDE_MONITOR_KEEP_STYLE=1 のときだけ有効にする(app.logで原因を調べるための試験用)。
+# 移動・最小化はPost系(PostMessage/ShowWindowAsync)で依頼するだけにする(_post_to_windowの説明参照。同期呼び出しで
+# 画面全体が固まった)。Windows実機で動作確認済み(2026-11-22)。
+# 予備: 環境変数 CLAUDE_MONITOR_NATIVE_FRAME=1 でWindows標準のタイトルバー(DWMでアプリの色に塗る)に戻せる。
 USE_WIN32_CHROME = os.name == "nt"
-USE_NATIVE_FRAME = USE_WIN32_CHROME and os.environ.get("CLAUDE_MONITOR_KEEP_STYLE") != "1"
+USE_NATIVE_FRAME = USE_WIN32_CHROME and os.environ.get("CLAUDE_MONITOR_NATIVE_FRAME") == "1"
 WINDOW_TITLE = "Claude Code Monitor"
 GWL_STYLE, GWL_EXSTYLE = -16, -20
 WS_POPUP, WS_MINIMIZEBOX = 0x80000000, 0x00020000
 WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = 0x00040000, 0x00000080
 SWP_FRAMECHANGED_FLAGS = 0x0020 | 0x0001 | 0x0002 | 0x0004 | 0x0010  # FRAMECHANGED|NOSIZE|NOMOVE|NOZORDER|NOACTIVATE
 WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
-WM_SYSCOMMAND, SC_MINIMIZE = 0x0112, 0xF020
+SW_MINIMIZE = 6
 MONITOR_DEFAULTTONEAREST = 2
 WIN_STYLE_DELAY_MS = 150      # 表示されてから(ウィンドウハンドルができてから)スタイルを変える
 # スタイル変更は起動時の1回だけ。定期的に付け直す作りにしたら、Windows実機でエクスプローラーが暴走して
@@ -2751,7 +2751,13 @@ def win32_start_move(root: tk.Tk) -> bool:
 
 def win32_minimize(root: tk.Tk) -> None:
     try:
-        _post_to_window(root, WM_SYSCOMMAND, SC_MINIMIZE, 0)  # 同期のShowWindowは使わない(上記の理由)
+        # 同期のShowWindowは使わない(_post_to_windowの理由)。WM_SYSCOMMAND(SC_MINIMIZE)のPostは実機で効かなかった
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+        if not user32.ShowWindowAsync(_wrapper_hwnd(root), SW_MINIMIZE):
+            logging.warning("ShowWindowAsync(SW_MINIMIZE) returned 0")
     except Exception:  # noqa: BLE001
         logging.warning("minimize failed", exc_info=True)
 
