@@ -979,7 +979,7 @@ async function clearSession(sessionId) {
   if (!s) return;
   if (s.working) { showToast(`'${s.name}' は作業中です。待機中(緑)になってから押してください`, true); return; }
   if (s.context_tokens === 0) { showToast(`'${s.name}' はまだ会話が無いので、クリアする必要はありません`); return; }
-  if (!confirm(`'${s.name}' に /session-end を送り、完了したら /clear で会話を空にします。\n(セッションは残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?`)) return;
+  // 確認ダイアログは出さない(利用者の指示、2026-11-24)
   try {
     const data = await apiPost('/api/clear', { session_id: sessionId });
     upsertJob(data.job);

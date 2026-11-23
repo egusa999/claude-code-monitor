@@ -2381,11 +2381,7 @@ class ClaudeMonitorApp:
         if info.context_tokens == 0:
             messagebox.showinfo("Claude Code Monitor", f"'{name}' はまだ会話が無いので、クリアする必要はありません。")
             return
-        if not messagebox.askyesno(
-                "Claude Code Monitor",
-                f"'{name}' に {SESSION_END_COMMAND} を送り、完了したら {CLEAR_COMMAND} で会話を空にします。\n"
-                "(セッションは残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?"):
-            return
+        # 確認ダイアログは出さない(利用者の指示、2026-11-24)
         logging.info("clear session: name=%s id=%s", name, session_id)
         self._start_busy(
             "clear", session_id,
