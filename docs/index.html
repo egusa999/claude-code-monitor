@@ -90,20 +90,7 @@
   .chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 0 22px; }
   .chips button { margin: 0 !important; }
   .row .cwd { margin-left: 22px; }
-  .uuid-btn {
-    font-weight: 400;
-    font-size: 10px;
-    color: var(--text-dim);
-    font-family: "Consolas", "SFMono-Regular", monospace;
-    margin-left: 8px;
-    padding: 1px 6px;
-    background: var(--track);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    cursor: pointer;
-    user-select: all;
-  }
-  .uuid-btn:hover, .hide-btn:hover { color: var(--text); border-color: var(--accent); }
+  .hide-btn:hover { color: var(--text); border-color: var(--accent); }
   .hide-btn {
     font-weight: 400;
     font-size: 10px;
@@ -181,12 +168,13 @@
   .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px;
          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .name { min-width: 0; overflow-wrap: anywhere; }
-  .end-btn {
+  .end-btn, .clear-btn {
     font-weight: 400; font-size: 10px; color: var(--text-dim); margin-left: 4px; padding: 1px 6px;
     background: var(--track); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
   }
   .end-btn:hover { color: var(--text); border-color: var(--red-on); }
-  .end-btn:disabled { opacity: 0.6; cursor: default; }
+  .clear-btn:hover { color: var(--text); border-color: var(--accent); }
+  .end-btn:disabled, .clear-btn:disabled { opacity: 0.6; cursor: default; }
   /* --- 実行中の操作(作成・終了)と信頼確認 --- */
   .jobs { border-bottom: 1px solid var(--border); }
   .job { padding: 8px 14px; font-size: 12px; background: var(--titlebar); border-top: 1px solid var(--border); }
@@ -428,7 +416,7 @@
     .usage .uring, .usage .uh.el { display: none; }  /* 経過リングは幅が足りないので省く */
   }
   @media (pointer: coarse) {
-    .uuid-btn, .hide-btn, .term-btn, .end-btn { font-size: 12px; padding: 5px 10px; margin-top: 4px; }
+    .hide-btn, .term-btn, .clear-btn, .end-btn { font-size: 12px; padding: 5px 10px; margin-top: 4px; }
     .titlebar button { font-size: 13px; padding: 6px 10px; }
   }
   .setup-panel .error { color: var(--red-on); font-size: 12px; margin: -4px 0 10px; min-height: 1em; }
@@ -586,7 +574,6 @@ changeAddressBtn.addEventListener('click', () => {
   showSetup(saved.replace(/^https?:\/\//, ''));
 });
 
-const revealedUuids = new Set();
 let lastLimit = 0;
 let lastSessions = [];
 
@@ -719,10 +706,9 @@ function renderRows(limit, sessions) {
   }
   rowsEl.innerHTML = visible.map(s => {
     const id = escapeHtml(s.session_id);
-    const uuidLabel = revealedUuids.has(s.session_id) ? id : 'UUID';
     return `
       <div class="row">
-        <div class="name"><div class="name-line"><div class="lamp ${s.working ? 'working' : ''}"></div><span class="name-text">${escapeHtml(s.name)}</span></div><div class="chips"><button type="button" class="uuid-btn" data-id="${id}">${uuidLabel}</button><button type="button" class="hide-btn" data-id="${id}">非表示</button>${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}${renderEndButton(s)}</div><span class="cwd">${escapeHtml(s.cwd)}</span></div>
+        <div class="name"><div class="name-line"><div class="lamp ${s.working ? 'working' : ''}"></div><span class="name-text">${escapeHtml(s.name)}</span></div><div class="chips">${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}${renderActionButtons(s)}<button type="button" class="hide-btn" data-id="${id}">非表示</button></div><span class="cwd">${escapeHtml(s.cwd)}</span></div>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${s.context_pct}%"></div></div>
           <div class="pct-wrap">
@@ -766,11 +752,9 @@ rowsEl.addEventListener('click', (e) => {
     });
     return;
   }
-  const uuidBtn = e.target.closest('.uuid-btn');
-  if (uuidBtn) {
-    const id = uuidBtn.dataset.id;
-    if (revealedUuids.has(id)) revealedUuids.delete(id); else revealedUuids.add(id);
-    renderRows(lastLimit, lastSessions);
+  const clearBtn = e.target.closest('.clear-btn');
+  if (clearBtn) {
+    clearSession(clearBtn.dataset.id);
     return;
   }
   const endBtn = e.target.closest('.end-btn');
@@ -977,11 +961,32 @@ async function apiPost(path, body) {
 function activeJobFor(name) {
   return jobs.find(j => !j.done && j.name === name);
 }
-function renderEndButton(s) {
+function renderActionButtons(s) {
   const m = TMUX_ATTACH_RE.exec(s.attach_cmd || '');
-  if (!m) return '';  // 終了はtmuxのセッションだけ(claude attach のbgは対象外)
+  if (!m) return '';  // クリア・終了はtmuxのセッションだけ(claude attach のbgは対象外)
   const busy = activeJobFor(m[1]);
-  return `<button type="button" class="end-btn" data-id="${escapeHtml(s.session_id)}" ${busy ? 'disabled' : ''}>${busy ? '終了中…' : '終了'}</button>`;
+  const id = escapeHtml(s.session_id);
+  const dis = busy ? 'disabled' : '';
+  const clearing = busy && busy.kind === 'clear';
+  const ending = busy && busy.kind === 'end';
+  return `<button type="button" class="clear-btn" data-id="${id}" ${dis}>${clearing ? 'クリア中…' : 'クリア'}</button>`
+    + `<button type="button" class="end-btn" data-id="${id}" ${dis}>${ending ? '終了中…' : '終了'}</button>`;
+}
+
+// クリア: /session-end の完了後に /clear を送る(セッションは残す)
+async function clearSession(sessionId) {
+  const s = lastSessions.find(x => x.session_id === sessionId);
+  if (!s) return;
+  if (s.working) { showToast(`'${s.name}' は作業中です。待機中(緑)になってから押してください`, true); return; }
+  if (s.context_tokens === 0) { showToast(`'${s.name}' はまだ会話が無いので、クリアする必要はありません`); return; }
+  if (!confirm(`'${s.name}' に /session-end を送り、完了したら /clear で会話を空にします。\n(セッションは残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?`)) return;
+  try {
+    const data = await apiPost('/api/clear', { session_id: sessionId });
+    upsertJob(data.job);
+    showToast(`'${s.name}' のクリアを始めました`);
+  } catch (e) {
+    showToast(`クリアできません: ${e.message}`, true);
+  }
 }
 
 async function endSession(sessionId) {
@@ -1036,7 +1041,7 @@ function renderJobs() {
   jobsEl.hidden = shown.length === 0;
   jobsEl.innerHTML = shown.map(j => {
     const id = escapeHtml(j.id);
-    const kind = j.kind === 'create' ? '作成' : '終了';
+    const kind = { create: '作成', clear: 'クリア' }[j.kind] || '終了';
     const text = j.done ? (j.error ? `失敗: ${j.error}` : (j.message || '完了')) : `${j.stage_label}…`;
     let html = `<div class="job ${j.done ? (j.error ? 'error' : 'done') : ''}"><div class="job-head">`
       + `<span class="job-text"><b>${escapeHtml(j.name)}</b>(${kind}): ${escapeHtml(text)}</span>`

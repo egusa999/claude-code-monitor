@@ -1212,10 +1212,15 @@ def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=
 
     run_command_workflow(name, INIT_COMMAND, session_id, ctl, get_session, sleep, clock)
     logging.info("'%s': %s finished; sending %s", name, INIT_COMMAND, CLEAR_COMMAND)
+    send_clear_and_wait(name, ctl, find_session, sleep, clock)
+
+
+def send_clear_and_wait(name: str, ctl, find_session, sleep=time.sleep, clock=time.monotonic) -> None:
+    """/clear を送り、完了まで待つ。完了は「コンテキスト量が0になった」ことで判断する(/clearは新しい会話を作り、
+    session_idが変わりうるため、find_session() は名前などidに依らない方法で探すこと)。"""
     ctl(SESSION_CTL_SEND_TEXT, name=name, text=CLEAR_COMMAND)
     sleep(END_ENTER_DELAY_SEC)
     ctl(SESSION_CTL_SEND_KEY, name=name, key="Enter")
-    # /clear の完了は「コンテキスト量が0になった」ことで判断する(/clearは新しい会話を作るため)
     waited = clock()
     while True:
         info = find_session()
@@ -1227,6 +1232,32 @@ def init_project_workflow(name: str, ctl, find_session, sleep=time.sleep, clock=
                             name, CLEAR_DONE_TIMEOUT_SEC, CLEAR_COMMAND)
             raise SessionCtlError(f"{CLEAR_COMMAND} 後にコンテキスト量が0になりませんでした。端末で確認してください")
         sleep(END_POLL_SEC)
+
+
+def clear_session_workflow(name: str, session_id: str, ctl, find_session,
+                           sleep=time.sleep, clock=time.monotonic) -> bool:
+    """「クリア」: tmuxセッション name へ /session-end を送り、完了してから /clear を送る(セッションは残す)。
+    /session-end が完了しなければ /clear は送らない(引き継ぎ前の会話を消さないため)。
+    コンテキスト量が0(会話が無い)なら何も送らず False を返す。クリアしたら True。
+    find_session() は name のセッションの最新SessionInfo(無ければNone。/clear後はidが変わりうるので名前で探す)。"""
+    info = find_session()
+    if info is None:
+        raise SessionCtlError("セッションが一覧に見つかりません")
+    if info.context_tokens == 0:
+        logging.info("'%s': context is 0; nothing to clear", name)
+        return False
+
+    def get_session(sid: str) -> "SessionInfo | None":
+        found = find_session()
+        return found if found is not None and found.session_id == sid else None
+
+    try:
+        run_command_workflow(name, SESSION_END_COMMAND, session_id, ctl, get_session, sleep, clock)
+    except SessionCtlError as e:
+        raise SessionCtlError(f"{e}({CLEAR_COMMAND} は送っていません)") from None
+    logging.info("'%s': %s finished; sending %s", name, SESSION_END_COMMAND, CLEAR_COMMAND)
+    send_clear_and_wait(name, ctl, find_session, sleep, clock)
+    return True
 
 
 class RemoteSessionSource:
@@ -1865,8 +1896,8 @@ class UsagePanel(tk.Canvas):
 class SessionRow(tk.Frame):
     """1セッション分の行ウィジェット(PWAの行と同じ構成: ランプ+名前/チップ/パス、右にバー)。"""
 
-    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_uuid,
-                 on_end=None, is_ending=None):
+    def __init__(self, master: tk.Widget, bg: str, open_terminal_fn,
+                 on_end=None, on_clear=None, busy_kind=None):
         super().__init__(master, bg=bg, height=ROW_HEIGHT_COMPACT)
         self.pack_propagate(False)
         self._bg = bg
@@ -1875,17 +1906,18 @@ class SessionRow(tk.Frame):
         self._attach_cmd = ""
         self._session_id = ""
         self._open_terminal_fn = open_terminal_fn
-        self._on_uuid = on_uuid
         self._name_font = tkfont.Font(family="Segoe UI", size=NAME_FONT_SIZE, weight="bold")
 
         self.name_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT, font=self._name_font, anchor="w")
         self.cwd_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT_DIM, font=("Segoe UI", 8), anchor="w")
-        self.uuid_chip = Chip(self, "UUID", lambda: self._on_uuid(self._session_id), bg)
+        # ボタンは 端末・クリア・終了(2026-11-23、UUIDは廃止)。
+        # クリア(/session-end→/clear)と終了(/session-end→削除)はリモートモードかつtmuxのセッションだけ
         self.term_chip = Chip(self, "端末", self._on_terminal, bg)
-        # 終了(/session-end→削除)はリモートモードかつtmuxのセッションだけ
         self._on_end = on_end
-        self._is_ending = is_ending or (lambda _sid: False)
+        self._on_clear = on_clear
+        self._busy_kind = busy_kind or (lambda _sid: None)
         self._info: SessionInfo | None = None
+        self.clear_chip = Chip(self, "クリア", lambda: self._on_clear(self._info), bg)
         self.end_chip = Chip(self, "終了", lambda: self._on_end(self._info), bg)
 
         self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=BAR_CANVAS_HEIGHT, bg=bg, highlightthickness=0)
@@ -1902,19 +1934,20 @@ class SessionRow(tk.Frame):
         if bg == self._bg:
             return
         self._bg = bg
-        for w in (self, self.name_label, self.cwd_label, self.uuid_chip,
-                  self.term_chip, self.end_chip, self.bar_canvas, self.lamp_canvas):
+        for w in (self, self.name_label, self.cwd_label, self.term_chip,
+                  self.clear_chip, self.end_chip, self.bar_canvas, self.lamp_canvas):
             w.config(bg=bg)
 
-    def update_data(self, info: SessionInfo, revealed: bool, name_col: int) -> None:
+    def update_data(self, info: SessionInfo, name_col: int) -> None:
         self._session_id = info.session_id
         self._attach_cmd = info.attach_cmd
         self._working = info.working
         self._info = info
-        self.end_chip.config(text="終了中…" if self._is_ending(info.session_id) else "終了")
+        busy = self._busy_kind(info.session_id)
+        self.clear_chip.config(text="クリア中…" if busy == "clear" else "クリア")
+        self.end_chip.config(text="終了中…" if busy == "end" else "終了")
         self.name_label.config(text=info.name)
         self.cwd_label.config(text=info.cwd)
-        self.uuid_chip.config(text=info.session_id if revealed else "UUID")
         self._draw_bar(info)
         self._draw_lamp()
         self._layout(info, name_col)
@@ -1938,24 +1971,25 @@ class SessionRow(tk.Frame):
         name_line = max(NAME_LINE_HEIGHT, self.name_label.winfo_reqheight())
         self.lamp_canvas.place(x=ROW_PADDING_X, y=ROW_NAME_Y + (name_line - LAMP_SIZE) // 2)
         self.name_label.place(x=text_x, y=ROW_NAME_Y, width=name_w + 4, height=name_line)
-        chips = [self.uuid_chip]
-        if info.attach_cmd:
-            chips.append(self.term_chip)
-        else:
-            self.term_chip.place_forget()
-        if self._on_end is not None and TMUX_ATTACH_PATTERN.match(info.attach_cmd):
-            chips.append(self.end_chip)
-        else:
-            self.end_chip.place_forget()
+        chips = []
+        tmux = TMUX_ATTACH_PATTERN.match(info.attach_cmd) is not None
+        for chip, shown in ((self.term_chip, bool(info.attach_cmd)),
+                            (self.clear_chip, self._on_clear is not None and tmux),
+                            (self.end_chip, self._on_end is not None and tmux)):
+            if shown:
+                chips.append(chip)
+            else:
+                chip.place_forget()
         max_x = ROW_PADDING_X + name_col - 4
         x, y = text_x, ROW_NAME_Y + name_line + 2
+        chips_h = CHIP_LINE_HEIGHT if chips else 0  # ボタンが1つも無ければ段を詰める
         for chip in chips:
             w = chip.winfo_reqwidth()
             if x + w > max_x and x > text_x:
                 x, y = text_x, y + CHIP_LINE_HEIGHT
             chip.place(x=x, y=y, height=CHIP_LINE_HEIGHT - 2)
             x += w + CHIP_GAP
-        cwd_y = y + CHIP_LINE_HEIGHT + 2
+        cwd_y = y + chips_h + 2
         self.cwd_label.place(x=text_x, y=cwd_y, width=text_w, height=14)
         self.config(height=max(cwd_y + 14 + ROW_PADDING_Y, BAR_CANVAS_HEIGHT + ROW_PADDING_Y * 2))
 
@@ -2008,7 +2042,6 @@ class ClaudeMonitorApp:
         self._ssh_host = ssh_host
         self._open_terminal_fn = lambda cmd: open_terminal(cmd, self._ssh_host)
         self.rows: dict[str, SessionRow] = {}
-        self._revealed: set[str] = set()
         self._last_sessions: list[SessionInfo] = []
 
         root.title(WINDOW_TITLE)
@@ -2034,7 +2067,7 @@ class ClaudeMonitorApp:
         self._kickoff_syncing = False
         self._kickoff_result: tuple[bool, bool] | None = None
         self._creating = False  # セッション作成の通信中(二重実行を防ぐ)
-        self._ending: set[str] = set()  # 「終了」処理中のsession_id(二重実行を防ぐ)
+        self._busy: dict[str, str] = {}  # 「終了」「クリア」処理中のsession_id→"end"/"clear"(二重実行を防ぐ)
         self._build_titlebar()
         self._usage_source = UsageSource(
             self._remote.fetch_usage if self._remote is not None else fetch_plan_usage)
@@ -2279,45 +2312,94 @@ class ClaudeMonitorApp:
             lambda: call_session_ctl(ssh_host, SESSION_CTL_START, name=name, dir=directory),
             lambda _result, error: self._on_created(name, ssh_host, init_project, error))
 
-    def end_session(self, info: SessionInfo | None) -> None:
-        """「終了」: /session-end を送り、完了を確認してからセッションを削除する(会話履歴は残る)。"""
-        if self._remote is None or info is None or info.session_id in self._ending:
-            return
+    def _busy_target(self, info: SessionInfo | None) -> tuple[str, str] | None:
+        """終了・クリアを始められるなら (tmux名, ssh先)。作業中なら案内を出して None。"""
+        if self._remote is None or info is None or info.session_id in self._busy:
+            return None
         m = TMUX_ATTACH_PATTERN.match(info.attach_cmd)
         if not m:
-            return
-        name, session_id, ssh_host = m.group(1), info.session_id, self._ssh_host
+            return None
         if info.working:
-            messagebox.showinfo("Claude Code Monitor", f"'{name}' は作業中です。待機中(緑)になってから押してください。")
+            messagebox.showinfo("Claude Code Monitor", f"'{m.group(1)}' は作業中です。待機中(緑)になってから押してください。")
+            return None
+        return m.group(1), self._ssh_host
+
+    def _remote_session_by_id(self, sid: str) -> SessionInfo | None:
+        sessions, _error = self._remote.get()  # 取得失敗中は前回値(スレッドセーフ)
+        return next((s for s in sessions if s.session_id == sid), None)
+
+    def _remote_session_by_name(self, name: str) -> SessionInfo | None:
+        marker = f"tmux attach -t ={name}"
+        sessions, _error = self._remote.get()
+        return next((s for s in sessions if s.attach_cmd == marker), None)
+
+    def _start_busy(self, kind: str, session_id: str, work, on_done) -> None:
+        """終了・クリアを別スレッドで実行する。実行中は行のボタンを「…中」にし、二重実行を防ぐ。"""
+        self._busy[session_id] = kind
+        self._render(*self._current_sessions())
+
+        def done(result, error: str | None) -> None:
+            self._busy.pop(session_id, None)
+            self._render(*self._current_sessions())
+            on_done(result, error)
+        run_in_background(self.root, work, done)
+
+    def end_session(self, info: SessionInfo | None) -> None:
+        """「終了」: /session-end を送り、完了を確認してからセッションを削除する(会話履歴は残る)。"""
+        target = self._busy_target(info)
+        if target is None:
             return
+        name, ssh_host = target
+        session_id = info.session_id
         # コンテキスト0(会話が無い)なら/session-endを送らず削除するだけなので、確認は出さない
         if info.context_tokens != 0 and not messagebox.askyesno(
                 "Claude Code Monitor",
                 f"'{name}' に {SESSION_END_COMMAND} を送り、完了したらセッションを削除します。\n"
                 "(会話履歴は残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?"):
             return
-        self._ending.add(session_id)
-        self._render(*self._current_sessions())
         logging.info("end session: name=%s id=%s", name, session_id)
-
-        def get_session(sid: str) -> SessionInfo | None:
-            sessions, _error = self._remote.get()  # 取得失敗中は前回値(スレッドセーフ)
-            return next((s for s in sessions if s.session_id == sid), None)
-
-        run_in_background(
-            self.root,
+        self._start_busy(
+            "end", session_id,
             lambda: end_session_workflow(
-                name, session_id, lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p), get_session),
-            lambda _result, error: self._on_ended(name, session_id, error))
+                name, session_id, lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p), self._remote_session_by_id),
+            lambda _result, error: self._on_ended(name, error))
 
-    def _on_ended(self, name: str, session_id: str, error: str | None) -> None:
-        self._ending.discard(session_id)
-        self._render(*self._current_sessions())
+    def _on_ended(self, name: str, error: str | None) -> None:
         if error:
             logging.error("end session failed: %s: %s", name, error)
             messagebox.showerror("Claude Code Monitor", f"'{name}' の終了処理を中断しました。\n\n{error}")
             return
         logging.info("end session done: %s", name)
+
+    def clear_session(self, info: SessionInfo | None) -> None:
+        """「クリア」: /session-end を送り、完了を確認してから /clear を送る(セッションは残す)。"""
+        target = self._busy_target(info)
+        if target is None:
+            return
+        name, ssh_host = target
+        session_id = info.session_id
+        if info.context_tokens == 0:
+            messagebox.showinfo("Claude Code Monitor", f"'{name}' はまだ会話が無いので、クリアする必要はありません。")
+            return
+        if not messagebox.askyesno(
+                "Claude Code Monitor",
+                f"'{name}' に {SESSION_END_COMMAND} を送り、完了したら {CLEAR_COMMAND} で会話を空にします。\n"
+                "(セッションは残ります。途中で質問が出たら端末で答えてください)\n\nよろしいですか?"):
+            return
+        logging.info("clear session: name=%s id=%s", name, session_id)
+        self._start_busy(
+            "clear", session_id,
+            lambda: clear_session_workflow(
+                name, session_id, lambda cmd, **p: call_session_ctl(ssh_host, cmd, **p),
+                lambda: self._remote_session_by_name(name)),
+            lambda _result, error: self._on_cleared(name, error))
+
+    def _on_cleared(self, name: str, error: str | None) -> None:
+        if error:
+            logging.error("clear session failed: %s: %s", name, error)
+            messagebox.showerror("Claude Code Monitor", f"'{name}' のクリアを中断しました。\n\n{error}")
+            return
+        logging.info("clear session done: %s", name)
 
     def _set_creating(self, creating: bool) -> None:
         self._creating = creating
@@ -2408,12 +2490,6 @@ class ClaudeMonitorApp:
         y = event.y_root - self._drag_y
         self.root.geometry(f"+{x}+{y}")
 
-    # -- UUID表示 -------------------------------------------------------
-
-    def _toggle_uuid(self, session_id: str) -> None:
-        self._revealed.symmetric_difference_update({session_id})
-        self._render(self._last_sessions, self._last_error)
-
     # -- データ更新 -----------------------------------------------------
 
     def _current_sessions(self) -> tuple[list[SessionInfo], str | None]:
@@ -2457,14 +2533,15 @@ class ClaudeMonitorApp:
             row_bg = COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG
             row = self.rows.get(info.session_id)
             if row is None:
+                remote = self._remote is not None
                 row = SessionRow(self.body, row_bg, self._open_terminal_fn,
-                                 self._toggle_uuid,
-                                 on_end=self.end_session if self._remote is not None else None,
-                                 is_ending=lambda sid: sid in self._ending)
+                                 on_end=self.end_session if remote else None,
+                                 on_clear=self.clear_session if remote else None,
+                                 busy_kind=self._busy.get)
                 self.rows[info.session_id] = row
             row.pack(fill="x")
             row.update_bg(row_bg)
-            row.update_data(info, info.session_id in self._revealed, self._name_col())
+            row.update_data(info, self._name_col())
 
         self._fit_scroll_area()
 

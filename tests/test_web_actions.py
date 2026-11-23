@@ -242,6 +242,119 @@ class JobTests(unittest.TestCase):
         self.assertEqual(cx.exception.status, 404)
 
 
+class FakeClaude:
+    """/session-end と /clear に反応する偽のセッション(偽ctl+一覧+時計)。
+    /session-end: 送信後しばらく作業中→待機。/clear: コンテキスト0+新しいsession_id(Claudeの/clearと同じ)。"""
+
+    def __init__(self, tokens=100, end_never_starts=False, clear_never_empties=False):
+        self.now = 0.0
+        self.info = session(tokens=tokens)
+        self.ctl = FakeCtl()
+        self.end_never_starts = end_never_starts
+        self.clear_never_empties = clear_never_empties
+        self.working_until = None
+        self.last_text = None
+        orig = self.ctl.__call__
+
+        def ctl(cmd, **params):
+            r = orig(cmd, **params)
+            if cmd == cm.SESSION_CTL_SEND_TEXT:
+                self.last_text = params["text"]
+            if cmd == cm.SESSION_CTL_SEND_KEY and params.get("key") == "Enter":
+                if self.last_text == cm.SESSION_END_COMMAND and not self.end_never_starts:
+                    self.working_until = self.now + 5
+                elif self.last_text == cm.CLEAR_COMMAND and not self.clear_never_empties:
+                    self.info = cm.SessionInfo(pid=1, session_id="s1-new", name="demo", cwd="/x", started_at=0,
+                                               context_tokens=0, attach_cmd="tmux attach -t =demo")
+            return r
+        self.call = ctl
+
+    def sleep(self, sec):
+        self.now += sec
+
+    def clock(self):
+        return self.now
+
+    def find(self):
+        self.info.working = self.working_until is not None and self.now < self.working_until
+        return self.info
+
+    def texts(self):
+        return [p["text"] for c, p in self.ctl.calls if c == cm.SESSION_CTL_SEND_TEXT]
+
+
+class ClearWorkflowTests(unittest.TestCase):
+    def run_clear(self, fake):
+        return cm.clear_session_workflow("demo", "s1", fake.call, fake.find, fake.sleep, fake.clock)
+
+    def test_session_end_then_clear(self):
+        fake = FakeClaude()
+        self.assertTrue(self.run_clear(fake))
+        self.assertEqual(fake.texts(), [cm.SESSION_END_COMMAND, cm.CLEAR_COMMAND])
+        self.assertNotIn(cm.SESSION_CTL_STOP, [c for c, _ in fake.ctl.calls])  # セッションは削除しない
+        self.assertEqual(fake.info.context_tokens, 0)
+
+    def test_context_zero_sends_nothing(self):
+        fake = FakeClaude(tokens=0)
+        self.assertFalse(self.run_clear(fake))
+        self.assertEqual(fake.ctl.calls, [])
+
+    def test_missing_session(self):
+        fake = FakeClaude()
+        with self.assertRaises(cm.SessionCtlError):
+            cm.clear_session_workflow("demo", "s1", fake.call, lambda: None, fake.sleep, fake.clock)
+        self.assertEqual(fake.ctl.calls, [])
+
+    def test_no_clear_when_session_end_does_not_finish(self):
+        fake = FakeClaude(end_never_starts=True)
+        with self.assertRaises(cm.SessionCtlError) as cx:
+            self.run_clear(fake)
+        self.assertIn(cm.CLEAR_COMMAND, str(cx.exception))
+        self.assertEqual(fake.texts(), [cm.SESSION_END_COMMAND])  # /clear は送らない
+
+    def test_pending_input_blocks_everything(self):
+        fake = FakeClaude()
+        fake.ctl.current = "─────\n❯ typing\n─────\n"
+        with self.assertRaises(cm.SessionCtlError):
+            self.run_clear(fake)
+        self.assertEqual(fake.texts(), [])
+
+    def test_clear_timeout(self):
+        fake = FakeClaude(clear_never_empties=True)
+        with self.assertRaises(cm.SessionCtlError):
+            self.run_clear(fake)
+        self.assertEqual(fake.texts(), [cm.SESSION_END_COMMAND, cm.CLEAR_COMMAND])
+
+
+class ClearJobTests(unittest.TestCase):
+    def test_clear_job(self):
+        fake = FakeClaude()
+        jobs = web.ActionJobs(ctl=fake.call, sessions=lambda: [fake.find()], sleep=fake.sleep,
+                              clock=fake.clock, spawn=lambda fn: fn())
+        job = jobs.clear("s1")
+        self.assertEqual((job.kind, job.stage), ("clear", "done"), job.error)
+        self.assertIn("クリアしました", job.message)
+        self.assertEqual(fake.texts(), [cm.SESSION_END_COMMAND, cm.CLEAR_COMMAND])
+
+    def test_clear_checks(self):
+        jobs, _ = make_jobs(FakeCtl(), [session(working=True), session("s2", "empty", tokens=0),
+                                        cm.SessionInfo(1, "s3", "b", "/", 0, context_tokens=5,
+                                                       attach_cmd="claude attach j1")])
+        for sid, status in (("s1", 409), ("s2", 409), ("s3", 400), ("missing", 404)):
+            with self.assertRaises(web.ApiError, msg=sid) as cx:
+                jobs.clear(sid)
+            self.assertEqual(cx.exception.status, status, sid)
+        self.assertEqual(jobs.list(), [])
+
+    def test_clear_and_end_are_exclusive(self):
+        ctl = FakeCtl()
+        jobs = web.ActionJobs(ctl=ctl, sessions=lambda: [session()], spawn=lambda fn: None)
+        jobs.clear("s1")
+        with self.assertRaises(web.ApiError) as cx:
+            jobs.end("s1")
+        self.assertEqual(cx.exception.status, 409)
+
+
 class HttpTests(unittest.TestCase):
     TOKEN = "t" * 40
 
@@ -271,7 +384,8 @@ class HttpTests(unittest.TestCase):
             return e.code, json.loads(e.read() or b"{}")
 
     def test_auth_required(self):
-        for path, body in (("/api/create/bases", None), ("/api/jobs", None), ("/api/create", {}), ("/api/end", {})):
+        for path, body in (("/api/create/bases", None), ("/api/jobs", None), ("/api/create", {}), ("/api/end", {}),
+                           ("/api/clear", {})):
             self.assertEqual(self.req(path, body, token=None)[0], 401)
             self.assertEqual(self.req(path, body, token="wrong" * 10)[0], 401)
 
@@ -290,6 +404,9 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/create", raw=b"[1,2]")[0], 400)
         self.assertEqual(self.req("/api/create", raw=b"x" * (web.MAX_BODY_BYTES + 1))[0], 413)
         self.assertEqual(self.req("/api/end", {"session_id": ""})[0], 400)
+        self.assertEqual(self.req("/api/clear", {"session_id": ""})[0], 400)
+        self.assertEqual(self.req("/api/clear", {"session_id": 5})[0], 400)
+        self.assertEqual(self.req("/api/clear", {"session_id": "missing"})[0], 404)
         self.assertEqual(self.req("/api/jobs/zzz")[0], 404)
         self.assertEqual(self.req("/api/jobs/zzz/trust", {"approve": True})[0], 404)
 

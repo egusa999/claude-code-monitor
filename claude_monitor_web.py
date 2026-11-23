@@ -791,6 +791,7 @@ STAGE_LABELS = {
     "trust": "信頼確認の回答待ち",
     "init": f"{claude_monitor.INIT_COMMAND} を実行中",
     "ending": f"{claude_monitor.SESSION_END_COMMAND} を実行中",
+    "clearing": f"{claude_monitor.SESSION_END_COMMAND} → {claude_monitor.CLEAR_COMMAND} を実行中",
     "done": "完了",
     "error": "失敗",
 }
@@ -809,7 +810,7 @@ class Job:
         self.id = uuid.uuid4().hex
         self.kind = kind
         self.name = name
-        self.stage = "starting" if kind == "create" else "ending"
+        self.stage = {"create": "starting", "clear": "clearing"}.get(kind, "ending")
         self.error = ""
         self.message = ""
         self.trust_pane: list[str] = []
@@ -950,17 +951,21 @@ class ActionJobs:
         job.trust_answered.set()
         return job
 
-    # --- 終了 ---
-    def end(self, session_id: str) -> Job:
+    # --- 終了・クリア ---
+    def _tmux_session(self, session_id: str, action: str) -> tuple[str, "SessionInfo"]:
+        """終了・クリアの対象(tmuxで動いていて待機中のセッション)を探し、(tmux名, SessionInfo)を返す。"""
         info = next((s for s in self._sessions() if s.session_id == session_id), None)
         if info is None:
             raise ApiError(404, "セッションが一覧に見つかりません")
         m = claude_monitor.TMUX_ATTACH_PATTERN.match(info.attach_cmd)
         if not m:
-            raise ApiError(400, "tmuxで動いているセッションだけ終了できます")
+            raise ApiError(400, f"tmuxで動いているセッションだけ{action}できます")
         if info.working:
             raise ApiError(409, "作業中です。待機中(緑)になってから押してください")
-        name = m.group(1)
+        return m.group(1), info
+
+    def end(self, session_id: str) -> Job:
+        name, _info = self._tmux_session(session_id, "終了")
         job = self._register("end", name)
         logging.info("end session (PWA): name=%s id=%s", name, session_id)
 
@@ -970,6 +975,25 @@ class ActionJobs:
         def work() -> None:
             claude_monitor.end_session_workflow(name, session_id, self._ctl, get_session, self._sleep, self._clock)
             self._finish(job, message=f"'{name}' を終了しました")
+        self._run(job, work)
+        return job
+
+    def clear(self, session_id: str) -> Job:
+        """/session-end の完了後に /clear を送る(セッションは残す)。会話が無ければ何も送らない。"""
+        name, info = self._tmux_session(session_id, "クリア")
+        if info.context_tokens == 0:
+            raise ApiError(409, "まだ会話が無いので、クリアする必要はありません")
+        job = self._register("clear", name)
+        logging.info("clear session (PWA): name=%s id=%s", name, session_id)
+        marker = f"tmux attach -t ={name}"
+
+        def find_session():  # /clear後はsession_idが変わりうるので名前で探す
+            return next((s for s in self._sessions() if s.attach_cmd == marker), None)
+
+        def work() -> None:
+            cleared = claude_monitor.clear_session_workflow(
+                name, session_id, self._ctl, find_session, self._sleep, self._clock)
+            self._finish(job, message=f"'{name}' をクリアしました" if cleared else f"'{name}' は会話が無いので何もしていません")
         self._run(job, work)
         return job
 
@@ -1129,7 +1153,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
-    ACTION_ROUTES = ("/api/create/listdir", "/api/create/md_status", "/api/create", "/api/end")
+    ACTION_ROUTES = ("/api/create/listdir", "/api/create/md_status", "/api/create", "/api/end", "/api/clear")
 
     def _action(self, body: dict) -> dict:
         ctl = self.jobs._ctl
@@ -1142,11 +1166,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
         if self.path == "/api/create":
             return {"job": self.jobs.create(body.get("base"), body.get("folder"), body.get("name"),
                                             bool(body.get("init"))).to_dict()}
-        if self.path == "/api/end":
+        if self.path in ("/api/end", "/api/clear"):
             sid = body.get("session_id")
             if not isinstance(sid, str) or not sid:
                 raise ApiError(400, "session_id がありません")
-            return {"job": self.jobs.end(sid).to_dict()}
+            job = self.jobs.end(sid) if self.path == "/api/end" else self.jobs.clear(sid)
+            return {"job": job.to_dict()}
         job_id = self.path[len("/api/jobs/"):-len("/trust")]
         return {"job": self.jobs.answer_trust(job_id, body.get("approve") is True).to_dict()}
 

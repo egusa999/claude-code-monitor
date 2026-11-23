@@ -17,6 +17,7 @@ class RowLayoutTest(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.geometry(f"{cm.WINDOW_WIDTH}x300")
+        self.busy = {}
 
     def tearDown(self):
         self.root.destroy()
@@ -25,10 +26,11 @@ class RowLayoutTest(unittest.TestCase):
 
     def make_row(self, info, width=cm.WINDOW_WIDTH, with_end=True):
         self.root.geometry(f"{width}x300")
-        row = cm.SessionRow(self.root, cm.COLOR_ROW_BG, lambda cmd: True, lambda sid: None,
-                            on_end=(lambda i: None) if with_end else None)
+        row = cm.SessionRow(self.root, cm.COLOR_ROW_BG, lambda cmd: True,
+                            on_end=(lambda i: None) if with_end else None,
+                            on_clear=(lambda i: None) if with_end else None, busy_kind=self.busy.get)
         row.pack(fill="x")
-        row.update_data(info, False, cm.name_col_width(width))
+        row.update_data(info, cm.name_col_width(width))
         for _ in range(3):
             self.root.update()
         return row
@@ -53,11 +55,16 @@ class RowLayoutTest(unittest.TestCase):
         self.assertGreaterEqual(ly, ny)
         self.assertLessEqual(ly + lh, ny + nh)
         # ボタンはすべて名前の下の段で、名前の頭に字下げを揃える
-        chips = [row.uuid_chip, row.term_chip, row.end_chip]
+        chips = [row.term_chip, row.clear_chip, row.end_chip]
         for chip in chips:
             self.assertTrue(chip.winfo_ismapped())
             self.assertGreaterEqual(chip.winfo_y(), ny + nh)
-        self.assertEqual(row.uuid_chip.winfo_x(), nx)
+        self.assertEqual(row.term_chip.winfo_x(), nx)
+        # 並びは 端末・クリア・終了(UUIDは無い)
+        xs = [c.winfo_x() for c in chips]
+        self.assertEqual(xs, sorted(xs))
+        self.assertEqual([c.cget("text") for c in chips], ["端末", "クリア", "終了"])
+        self.assertFalse(hasattr(row, "uuid_chip"))
         # パスはボタンの下、同じ字下げ
         cx, cy, _, _ = geom(row.cwd_label)
         self.assertEqual(cx, nx)
@@ -66,11 +73,32 @@ class RowLayoutTest(unittest.TestCase):
         bx, _, bw, _ = geom(row.bar_canvas)
         self.assertEqual(bx + bw, cm.WINDOW_WIDTH - cm.ROW_PADDING_X)
 
-    def test_no_terminal_or_end_chip_without_tmux(self):
+    def test_no_chips_without_attach(self):
         row = self.make_row(self.info(attach=""))
-        self.assertTrue(row.uuid_chip.winfo_ismapped())
-        self.assertFalse(row.term_chip.winfo_ismapped())
+        for chip in (row.term_chip, row.clear_chip, row.end_chip):
+            self.assertFalse(chip.winfo_ismapped())
+        # ボタンの段を詰め、パスは名前のすぐ下
+        self.assertLess(row.cwd_label.winfo_y(), row.name_label.winfo_y() + row.name_label.winfo_height() + 6)
+
+    def test_bg_job_has_terminal_only(self):
+        row = self.make_row(self.info(attach="claude attach j1"))
+        self.assertTrue(row.term_chip.winfo_ismapped())
+        self.assertFalse(row.clear_chip.winfo_ismapped())
         self.assertFalse(row.end_chip.winfo_ismapped())
+
+    def test_local_mode_has_terminal_only(self):
+        row = self.make_row(self.info(), with_end=False)
+        self.assertTrue(row.term_chip.winfo_ismapped())
+        self.assertFalse(row.clear_chip.winfo_ismapped())
+        self.assertFalse(row.end_chip.winfo_ismapped())
+
+    def test_busy_labels(self):
+        self.busy["sid-1"] = "clear"
+        row = self.make_row(self.info())
+        self.assertEqual((row.clear_chip.cget("text"), row.end_chip.cget("text")), ("クリア中…", "終了"))
+        self.busy["sid-1"] = "end"
+        row.update_data(self.info(), cm.name_col_width(cm.WINDOW_WIDTH))
+        self.assertEqual((row.clear_chip.cget("text"), row.end_chip.cget("text")), ("クリア", "終了中…"))
 
     def test_long_name_is_ellipsized_within_name_col(self):
         row = self.make_row(self.info(name="VeryLongSessionName" * 6))
@@ -80,23 +108,10 @@ class RowLayoutTest(unittest.TestCase):
     def test_chips_wrap_at_minimum_width(self):
         width = cm.MIN_WINDOW_WIDTH
         row = self.make_row(self.info(), width=width)
-        for w in (row.name_label, row.uuid_chip, row.term_chip, row.end_chip, row.cwd_label):
+        for w in (row.name_label, row.term_chip, row.clear_chip, row.end_chip, row.cwd_label):
             self.assert_inside_name_col(row, w, width)
         # 行の高さはパスの下端まで確保される(次の行に重ならない)
         self.assertGreaterEqual(row.winfo_height(), row.cwd_label.winfo_y() + row.cwd_label.winfo_height())
-
-    def test_revealed_uuid_wraps_following_chips(self):
-        row = cm.SessionRow(self.root, cm.COLOR_ROW_BG, lambda cmd: True, lambda sid: None,
-                            on_end=lambda i: None)
-        row.pack(fill="x")
-        info = self.info()
-        info.session_id = "0123456789abcdef-0123456789abcdef"
-        row.update_data(info, True, cm.name_col_width(cm.WINDOW_WIDTH))
-        for _ in range(3):
-            self.root.update()
-        for w in (row.uuid_chip, row.term_chip, row.end_chip):
-            self.assert_inside_name_col(row, w, cm.WINDOW_WIDTH)
-        self.assertGreaterEqual(row.cwd_label.winfo_y(), row.end_chip.winfo_y() + row.end_chip.winfo_height())
 
     def test_working_lamp_blinks(self):
         row = self.make_row(self.info(working=True))
