@@ -131,9 +131,13 @@ CHIP_LINE_HEIGHT = 22
 CHIP_GAP = 4
 CHIP_FONT = ("Segoe UI", 8)
 HEADER_HEIGHT = 28
-# コンテキスト列はステータス(ランプ)の直前に置く(ステータス列を詰めた分をセッション名の列に回す)
+# 行はPWAと同じ並び(2026-11-23): 1段目=ランプ+セッション名(大きめ)、2段目=ボタン、3段目=パス。右端はコンテキスト列のみ
+# (ステータス列は無し。ランプは名前の前)。ボタンとパスはランプの幅だけ字下げして名前の頭に揃える
 BAR_COL_WIDTH = 190
-STATUS_COL_WIDTH = 32
+LAMP_SIZE = 14            # PWAの.lamp(14px)
+LAMP_GAP = 8              # ランプと名前の間(PWAのgap)
+NAME_INDENT = LAMP_SIZE + LAMP_GAP  # ボタン・パスの字下げ(PWAの22px)
+NAME_FONT_SIZE = 13       # PWAの17pxに相当
 BAR_TRACK_WIDTH = 70
 MODEL_FONT_SIZE = 9       # コンテキスト列のモデル名
 CONTEXT_FONT_SIZE = 10    # コンテキスト列の「% (使用/上限)」
@@ -200,8 +204,8 @@ SCREEN_MARGIN_PX = 80   # 自動で高さを合わせるとき、画面の高さ
 
 
 def name_col_width(window_width: int) -> int:
-    """名前列の幅(残りをバー列とステータス列が占める)。"""
-    return window_width - ROW_PADDING_X * 2 - BAR_COL_WIDTH - STATUS_COL_WIDTH
+    """名前列の幅(残りをバー列が占める)。"""
+    return window_width - ROW_PADDING_X * 2 - BAR_COL_WIDTH
 UI_PREFS_PATH = Path.home() / ".claude_monitor" / "ui.json"  # 画面設定(最前面ピン)
 POLL_INTERVAL_MS = 1500             # セッション一覧・使用量の再取得間隔
 AGENT_VISIBLE_SEC = 120.0           # サブエージェントのトランスクリプトが、この秒数以内に更新されていれば一覧に出す
@@ -1859,9 +1863,7 @@ class UsagePanel(tk.Canvas):
 
 
 class SessionRow(tk.Frame):
-    """1セッション分の行ウィジェット(PWAの行と同じ構成: 名前+チップ/パス、バー、ランプ)。"""
-
-    LAMP_SIZE = 16
+    """1セッション分の行ウィジェット(PWAの行と同じ構成: ランプ+名前/チップ/パス、右にバー)。"""
 
     def __init__(self, master: tk.Widget, bg: str, open_terminal_fn, on_uuid,
                  on_end=None, is_ending=None):
@@ -1874,7 +1876,7 @@ class SessionRow(tk.Frame):
         self._session_id = ""
         self._open_terminal_fn = open_terminal_fn
         self._on_uuid = on_uuid
-        self._name_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+        self._name_font = tkfont.Font(family="Segoe UI", size=NAME_FONT_SIZE, weight="bold")
 
         self.name_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT, font=self._name_font, anchor="w")
         self.cwd_label = tk.Label(self, text="", bg=bg, fg=COLOR_TEXT_DIM, font=("Segoe UI", 8), anchor="w")
@@ -1887,10 +1889,8 @@ class SessionRow(tk.Frame):
         self.end_chip = Chip(self, "終了", lambda: self._on_end(self._info), bg)
 
         self.bar_canvas = tk.Canvas(self, width=BAR_COL_WIDTH, height=BAR_CANVAS_HEIGHT, bg=bg, highlightthickness=0)
-        self.bar_canvas.place(relx=1.0, x=-(ROW_PADDING_X + STATUS_COL_WIDTH), rely=0.5, anchor="e")
-        self.lamp_canvas = tk.Canvas(self, width=self.LAMP_SIZE + 8, height=self.LAMP_SIZE + 8,
-                                     bg=bg, highlightthickness=0)
-        self.lamp_canvas.place(relx=1.0, x=-ROW_PADDING_X, rely=0.5, anchor="e")
+        self.bar_canvas.place(relx=1.0, x=-ROW_PADDING_X, rely=0.5, anchor="e")
+        self.lamp_canvas = tk.Canvas(self, width=LAMP_SIZE, height=LAMP_SIZE, bg=bg, highlightthickness=0)
 
     def _on_terminal(self) -> None:
         if not self._open_terminal_fn(self._attach_cmd):
@@ -1927,13 +1927,17 @@ class SessionRow(tk.Frame):
         return text + "…"
 
     def _layout(self, info: SessionInfo, name_col: int) -> None:
-        """名前の右にチップを並べ、列幅に収まらなければ次の行へ折り返す(PWAと同じ挙動)。"""
+        """1段目にランプ+名前、2段目にチップ(列幅に収まらなければ折り返す)、3段目にパス(PWAと同じ並び)。"""
+        text_x = ROW_PADDING_X + NAME_INDENT
+        text_w = max(name_col - NAME_INDENT - 4, 40)
         # 名前が列幅を超えるとバー(右隣の列)に隠れるため、収まらない分は「…」で省略する
-        shown = self._ellipsize(info.name, max(name_col - ROW_PADDING_X - 4, 40))
+        shown = self._ellipsize(info.name, text_w)
         self.name_label.config(text=shown)
         name_w = self._name_font.measure(shown)
         # フォントによって行の高さが違うため、ラベル自身が要求する高さ以上を確保する(切れ防止)
         name_line = max(NAME_LINE_HEIGHT, self.name_label.winfo_reqheight())
+        self.lamp_canvas.place(x=ROW_PADDING_X, y=ROW_NAME_Y + (name_line - LAMP_SIZE) // 2)
+        self.name_label.place(x=text_x, y=ROW_NAME_Y, width=name_w + 4, height=name_line)
         chips = [self.uuid_chip]
         if info.attach_cmd:
             chips.append(self.term_chip)
@@ -1943,22 +1947,17 @@ class SessionRow(tk.Frame):
             chips.append(self.end_chip)
         else:
             self.end_chip.place_forget()
-        max_x = name_col - 4
-        x, y = ROW_PADDING_X + name_w + CHIP_GAP * 2, ROW_NAME_Y
-        wrapped = False
-        self.name_label.place(x=ROW_PADDING_X, y=ROW_NAME_Y, width=name_w + 4, height=name_line)
+        max_x = ROW_PADDING_X + name_col - 4
+        x, y = text_x, ROW_NAME_Y + name_line + 2
         for chip in chips:
             w = chip.winfo_reqwidth()
-            if x + w > max_x and not wrapped:
-                wrapped, x, y = True, ROW_PADDING_X, ROW_NAME_Y + name_line + 2
-            elif x + w > max_x:
-                x, y = ROW_PADDING_X, y + CHIP_LINE_HEIGHT
+            if x + w > max_x and x > text_x:
+                x, y = text_x, y + CHIP_LINE_HEIGHT
             chip.place(x=x, y=y, height=CHIP_LINE_HEIGHT - 2)
             x += w + CHIP_GAP
-        last_y = y if wrapped else ROW_NAME_Y
-        cwd_y = last_y + (CHIP_LINE_HEIGHT if wrapped else name_line) + 2
-        self.cwd_label.place(x=ROW_PADDING_X, y=cwd_y, width=max(name_col - ROW_PADDING_X, 40), height=14)
-        self.config(height=cwd_y + 14 + ROW_PADDING_Y)
+        cwd_y = y + CHIP_LINE_HEIGHT + 2
+        self.cwd_label.place(x=text_x, y=cwd_y, width=text_w, height=14)
+        self.config(height=max(cwd_y + 14 + ROW_PADDING_Y, BAR_CANVAS_HEIGHT + ROW_PADDING_Y * 2))
 
     def _draw_bar(self, info: SessionInfo) -> None:
         c = self.bar_canvas
@@ -1980,14 +1979,13 @@ class SessionRow(tk.Frame):
     def _draw_lamp(self) -> None:
         c = self.lamp_canvas
         c.delete("all")
-        size = self.LAMP_SIZE + 8
-        cx = cy = size // 2
-        r = self.LAMP_SIZE // 2
+        r = LAMP_SIZE // 2
+        cx = cy = r
         if self._working:
             color = COLOR_RED_ON if self._blink_on else COLOR_RED_OFF
         else:
             color = COLOR_GREEN
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="")
+        c.create_oval(cx - r, cy - r, cx + r - 1, cy + r - 1, fill=color, outline="")
 
     def toggle_blink(self) -> None:
         self._blink_on = not self._blink_on
@@ -2395,9 +2393,7 @@ class ClaudeMonitorApp:
         tk.Label(header, text="SESSION", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
             x=ROW_PADDING_X, y=8)
         tk.Label(header, text="CONTEXT USED", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
-            relx=1.0, x=-(ROW_PADDING_X + STATUS_COL_WIDTH + BAR_COL_WIDTH), y=8, anchor="nw")
-        tk.Label(header, text="STATUS", bg=COLOR_BG, fg=COLOR_TEXT_DIM, font=font).place(
-            relx=1.0, x=-ROW_PADDING_X, y=8, anchor="ne")
+            relx=1.0, x=-(ROW_PADDING_X + BAR_COL_WIDTH), y=8, anchor="nw")
 
     def _start_move(self, event: tk.Event) -> None:
         self._drag_x, self._drag_y = event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y()
