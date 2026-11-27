@@ -90,18 +90,6 @@
   .chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 0 22px; }
   .chips button { margin: 0 !important; }
   .row .cwd { margin-left: 22px; }
-  .hide-btn:hover { color: var(--text); border-color: var(--accent); }
-  .hide-btn {
-    font-weight: 400;
-    font-size: 10px;
-    color: var(--text-dim);
-    margin-left: 4px;
-    padding: 1px 6px;
-    background: var(--track);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    cursor: pointer;
-  }
   .term-btn {
     font-weight: 400;
     font-size: 10px;
@@ -114,57 +102,6 @@
     cursor: pointer;
   }
   .term-btn:hover { color: var(--text); border-color: var(--accent); }
-  .hidden-tray {
-    border-top: 1px solid var(--border);
-    padding: 10px 14px;
-    background: var(--titlebar);
-  }
-  .hidden-tray-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 11px;
-    color: var(--text-dim);
-    letter-spacing: 0.03em;
-    margin-bottom: 8px;
-  }
-  .hidden-tray-header button {
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    border-radius: 6px;
-    font-size: 11px;
-    padding: 2px 8px;
-    cursor: pointer;
-  }
-  .hidden-tray-header button:hover { color: var(--text); border-color: var(--accent); }
-  .hidden-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .hidden-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    color: var(--text-dim);
-    background: var(--track);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 3px 4px 3px 10px;
-  }
-  .hidden-chip button {
-    background: none;
-    border: none;
-    color: var(--text-dim);
-    cursor: pointer;
-    font-size: 13px;
-    line-height: 1;
-    padding: 2px 4px;
-  }
-  .hidden-chip button:hover { color: var(--text); }
-  .hidden-chip .lamp {
-    width: 8px;
-    height: 8px;
-    flex-shrink: 0;
-  }
   .cwd { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; margin-top: 2px;
          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .name { min-width: 0; overflow-wrap: anywhere; }
@@ -416,7 +353,7 @@
     .usage .uring, .usage .uh.el { display: none; }  /* 経過リングは幅が足りないので省く */
   }
   @media (pointer: coarse) {
-    .hide-btn, .term-btn, .clear-btn, .end-btn { font-size: 12px; padding: 5px 10px; margin-top: 4px; }
+    .term-btn, .clear-btn, .end-btn { font-size: 12px; padding: 5px 10px; margin-top: 4px; }
     .titlebar button { font-size: 13px; padding: 6px 10px; }
   }
   /* --- 表示切替タブ(セッション / RPA agent)。agentはサーバーで有効なときだけ出す --- */
@@ -479,13 +416,6 @@
         <span>SESSION</span><span class="h-context">CONTEXT USED</span>
       </div>
       <div id="rows"></div>
-      <div id="hidden-tray" class="hidden-tray" hidden>
-        <div class="hidden-tray-header">
-          <span>非表示中 (<span id="hidden-count">0</span>)</span>
-          <button id="show-hidden" type="button">すべて戻す</button>
-        </div>
-        <div id="hidden-chips" class="hidden-chips"></div>
-      </div>
     </div>
   </div>
 
@@ -505,7 +435,7 @@
 <script>
 const STORAGE_KEY = 'claudeMonitorServerAddress';
 const TOKEN_STORAGE_KEY = 'claudeMonitorToken';
-const HIDDEN_STORAGE_KEY = 'claudeMonitorHiddenSessions';
+const HIDDEN_STORAGE_KEY = 'claudeMonitorHiddenSessions';  // 廃止した非表示機能の保存キー(起動時に消すだけ)
 const POLL_INTERVAL_MS = 1500;
 
 const setupEl = document.getElementById('setup');
@@ -607,80 +537,8 @@ changeAddressBtn.addEventListener('click', () => {
 let lastLimit = 0;
 let lastSessions = [];
 
-// 非表示にしたセッションIDはこの端末(ブラウザ)に保存し、次回起動時も維持する。
-function loadHiddenSessions() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(HIDDEN_STORAGE_KEY) || '[]');
-    return new Set(Array.isArray(raw) ? raw : []);
-  } catch (e) {
-    return new Set();
-  }
-}
-const hiddenSessions = loadHiddenSessions();
-function saveHiddenSessions() {
-  try { localStorage.setItem(HIDDEN_STORAGE_KEY, JSON.stringify([...hiddenSessions])); } catch (e) { /* ignore */ }
-}
-const hiddenTrayEl = document.getElementById('hidden-tray');
-const hiddenCountEl = document.getElementById('hidden-count');
-const hiddenChipsEl = document.getElementById('hidden-chips');
-const showHiddenBtn = document.getElementById('show-hidden');
-
-// 非表示にしたセッションは一覧から消すのではなく、パネル下部の「非表示中」
-// トレイにまとめておき、個別またはまとめて元に戻せるようにする。
-
-// セッションが終了(プロセス消滅)した後もIDがlocalStorageに残り続けないよう、
-// 現在生存中のセッション一覧に何回連続で現れなかったかを数え、猶予回数を
-// 超えたら自動的にhiddenSessionsから取り除く。1回だけ一覧から消えても
-// 即削除しないのは、meta_fileの読み取りが書き込み中などで一時的に失敗し、
-// 生存中のセッションが1ポーリングだけ一覧から欠落することがあるため
-// (誤って非表示を解除してしまう事故を防ぐ)。
-const HIDDEN_PRUNE_GRACE_POLLS = 3;
-const hiddenMissingStreak = new Map();
-function pruneStaleHiddenSessions(sessions) {
-  const liveIds = new Set(sessions.map(s => s.session_id));
-  let changed = false;
-  for (const id of [...hiddenSessions]) {
-    if (liveIds.has(id)) {
-      hiddenMissingStreak.delete(id);
-      continue;
-    }
-    const streak = (hiddenMissingStreak.get(id) || 0) + 1;
-    if (streak >= HIDDEN_PRUNE_GRACE_POLLS) {
-      hiddenSessions.delete(id);
-      hiddenMissingStreak.delete(id);
-      changed = true;
-    } else {
-      hiddenMissingStreak.set(id, streak);
-    }
-  }
-  if (changed) saveHiddenSessions();
-}
-function renderHiddenTray(sessions) {
-  pruneStaleHiddenSessions(sessions);
-  if (isRpaView()) { hiddenTrayEl.hidden = true; return; }  // agentタブ表示中は出さない
-  const hidden = sessions.filter(s => hiddenSessions.has(s.session_id));
-  if (hidden.length === 0) {
-    hiddenTrayEl.hidden = true;
-    return;
-  }
-  hiddenTrayEl.hidden = false;
-  hiddenCountEl.textContent = hidden.length;
-  hiddenChipsEl.innerHTML = hidden.map(s => `
-    <span class="hidden-chip">${escapeHtml(s.name)}<div class="lamp ${s.working ? 'working' : ''}"></div><button type="button" class="unhide-btn" data-id="${escapeHtml(s.session_id)}" title="表示に戻す">&#10005;</button></span>
-  `).join('');
-}
-showHiddenBtn.addEventListener('click', () => {
-  hiddenSessions.clear();
-  saveHiddenSessions();
-  renderRows(lastLimit, lastSessions);
-});
-hiddenChipsEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('.unhide-btn');
-  if (!btn) return;
-  hiddenSessions.delete(btn.dataset.id);
-  saveHiddenSessions();
-  renderRows(lastLimit, lastSessions);
-});
+// 非表示機能は廃止(2026-11-27、GUIと同じく全セッションを常に表示)。以前に隠したIDが端末に残っていれば消す。
+try { localStorage.removeItem(HIDDEN_STORAGE_KEY); } catch (e) { /* ignore */ }
 
 // インストール済みPWA(standaloneウィンドウ)の場合のみ、コンテンツの実サイズに
 // 合わせてウィンドウ自体をリサイズする。通常のブラウザタブでは何もしない
@@ -723,23 +581,15 @@ function renderAgents(s, limit) {
 }
 
 function renderRows(limit, sessions) {
-  renderHiddenTray(sessions);
   if (sessions.length === 0) {
     rowsEl.innerHTML = '<div class="empty">アクティブなセッションはありません</div>';
     fitWindowToContent();
     return;
   }
-  const visible = sessions.filter(s => !hiddenSessions.has(s.session_id));
-  if (visible.length === 0) {
-    rowsEl.innerHTML = '<div class="empty">表示中のセッションはありません(下の「非表示中」欄から戻せます)</div>';
-    fitWindowToContent();
-    return;
-  }
-  rowsEl.innerHTML = visible.map(s => {
-    const id = escapeHtml(s.session_id);
+  rowsEl.innerHTML = sessions.map(s => {
     return `
       <div class="row">
-        <div class="name"><div class="name-line"><div class="lamp ${s.working ? 'working' : ''}"></div><span class="name-text">${escapeHtml(s.name)}</span></div><div class="chips">${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}${renderActionButtons(s)}<button type="button" class="hide-btn" data-id="${id}">非表示</button></div><span class="cwd">${escapeHtml(s.cwd)}</span></div>
+        <div class="name"><div class="name-line"><div class="lamp ${s.working ? 'working' : ''}"></div><span class="name-text">${escapeHtml(s.name)}</span></div><div class="chips">${s.attach_cmd ? `<button type="button" class="term-btn" data-cmd="${escapeHtml(s.attach_cmd)}" title="${escapeHtml(s.attach_cmd)}">端末</button>` : ''}${renderActionButtons(s)}</div><span class="cwd">${escapeHtml(s.cwd)}</span></div>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${s.context_pct}%"></div></div>
           <div class="pct-wrap">
@@ -792,12 +642,6 @@ rowsEl.addEventListener('click', (e) => {
   if (endBtn) {
     endSession(endBtn.dataset.id);
     return;
-  }
-  const hideBtn = e.target.closest('.hide-btn');
-  if (hideBtn) {
-    hiddenSessions.add(hideBtn.dataset.id);
-    saveHiddenSessions();
-    renderRows(lastLimit, lastSessions);
   }
 });
 
@@ -1367,7 +1211,6 @@ function applyView() {
   viewTabsEl.hidden = !rpaEnabled;
   for (const b of viewTabsEl.querySelectorAll('button')) b.classList.toggle('active', b.dataset.view === (showAgents ? 'agents' : 'sessions'));
   for (const id of SESSION_VIEW_IDS) document.getElementById(id).hidden = showAgents;
-  renderHiddenTray(lastSessions);
   rpaRowsEl.hidden = !showAgents;
   rpaSummaryEl.hidden = !showAgents;
   if (showAgents && !rpaTimer) { refreshRpaAgents(); rpaTimer = setInterval(refreshRpaAgents, RPA_POLL_MS); }
