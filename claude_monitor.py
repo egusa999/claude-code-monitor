@@ -2066,15 +2066,15 @@ COLOR_AGENT_STALE_BG = "#3a2230"   # 更新が止まったPCの行の背景(赤�
 AGENT_NAME_FONT_SIZE = 12
 AGENT_FIELD_LABEL_WIDTH = 64
 AGENT_STALE_BAR_WIDTH = 3
-# 欄: (キー, 見出し)。名前・PC・状態・最終更新は上の段に出すので除く(並びはRPA側GUIと同じ)
-AGENT_FIELDS: tuple[tuple[str, str], ...] = (
-    ("hope", "HOPE"), ("sender", "送信元"), ("lock", "占有"), ("command", "実行中"),
-    ("hours", "使用時間"), ("foreground", "前面"))
+# 欄: (キー, 見出し)。1行目=名前(無ければPC名)・状態・使用時間・HOPE、2行目=送信元・占有・実行中の命令
+# (2026-11-27利用者の指定。値が無くても「-」で出し、どのPCも同じ並びにする)
+AGENT_HEAD_FIELDS: tuple[tuple[str, str], ...] = (("hours", "使用時間"), ("hope", "HOPE"))
+AGENT_SUB_FIELDS: tuple[tuple[str, str], ...] = (("sender", "送信元"), ("lock", "占有"), ("command", "実行中の命令"))
 NO_VALUE = "-"
 
 
 def agent_row_view(row: dict) -> dict:
-    """/api/agents の1行を画面表示用にする(ランプ色・名前・PC・2段目・欄の一覧)。"""
+    """/api/agents の1行を画面表示用にする(ランプ色・名前・状態・1行目と2行目の欄)。"""
     stale = bool(row.get("stale"))
     tag = row.get("tag")
     if stale:
@@ -2086,13 +2086,13 @@ def agent_row_view(row: dict) -> dict:
     else:
         lamp = COLOR_TEXT_DIM
     label = str(row.get("label") or NO_VALUE)
-    pc = str(row.get("pc") or "")
-    named = label != NO_VALUE
-    fields = [(title, str(row[key])) for key, title in AGENT_FIELDS
-              if row.get(key) not in (None, "", NO_VALUE)]
-    return {"stale": stale, "lamp": lamp, "name": label if named else (pc or NO_VALUE),
-            "pc": pc if named else "", "state": str(row.get("state") or NO_VALUE),
-            "updated": str(row.get("updated") or NO_VALUE), "fields": fields}
+    name = label if label != NO_VALUE else str(row.get("pc") or NO_VALUE)
+
+    def values(spec):
+        return [(title, str(row.get(key) or NO_VALUE)) for key, title in spec]
+
+    return {"stale": stale, "lamp": lamp, "name": name, "state": str(row.get("state") or NO_VALUE),
+            "head_fields": values(AGENT_HEAD_FIELDS), "fields": values(AGENT_SUB_FIELDS)}
 
 
 def agent_summary(payload: dict) -> tuple[str, bool]:
@@ -2126,7 +2126,7 @@ def wrap_agent_fields(widths: list[int], avail: int, gap: int) -> list[list[int]
 
 
 class AgentRow(tk.Frame):
-    """agentタブの1台分(1行目=ランプ・名前・PC名・状態・最終更新を横並び、2行目以降=残りの欄を横並び)。"""
+    """agentタブの1台分(1行目=ランプ・名前・状態・使用時間・HOPE、2行目=送信元・占有・実行中の命令。幅が足りなければ欄単位で折り返す)。"""
 
     FIELD_GAP = 14
 
@@ -2145,15 +2145,13 @@ class AgentRow(tk.Frame):
         self.lamp_canvas.pack(side="left", padx=(0, LAMP_GAP))
         self.name_label = tk.Label(head, font=self._name_font, fg=COLOR_TEXT, anchor="w")
         self.name_label.pack(side="left")
-        self.pc_label = tk.Label(head, font=("Segoe UI", 8), fg=COLOR_TEXT_DIM, anchor="w")
-        self.pc_label.pack(side="left", padx=(6, 0))
         self.state_label = tk.Label(head, font=("Segoe UI", 9), fg=COLOR_TEXT_DIM, anchor="w")
         self.state_label.pack(side="left", padx=(8, 0))
-        self.updated_label = tk.Label(head, font=("Segoe UI", 9), anchor="w")
-        self.updated_label.pack(side="left")
+        self.head_fields_frame = tk.Frame(head)
+        self.head_fields_frame.pack(side="left", padx=(self.FIELD_GAP, 0))
         self.fields_frame = tk.Frame(self.inner)
         self.fields_frame.pack(fill="x", padx=(NAME_INDENT, 0))
-        self._containers = (self, self.inner, head, self.fields_frame)
+        self._containers = (self, self.inner, head, self.head_fields_frame, self.fields_frame)
 
     def update_data(self, view: dict, bg: str, width: int = WINDOW_WIDTH) -> None:
         key = (repr(view), bg, width)
@@ -2168,14 +2166,12 @@ class AgentRow(tk.Frame):
         self.lamp_canvas.delete("all")
         self.lamp_canvas.create_oval(1, 1, LAMP_SIZE - 2, LAMP_SIZE - 2, fill=view["lamp"], outline="")
         self.name_label.config(text=view["name"], bg=row_bg)
-        self.pc_label.config(text=view["pc"], bg=row_bg)
-        if not view["pc"]:
-            self.pc_label.pack_forget()
-        elif not self.pc_label.winfo_manager():
-            self.pc_label.pack(side="left", padx=(6, 0), before=self.state_label)
-        self.state_label.config(text=f"{view['state']} ・ ", bg=row_bg)
-        self.updated_label.config(text=view["updated"], bg=row_bg,
-                                  fg=COLOR_RED_ON if view["stale"] else COLOR_TEXT_DIM)
+        self.state_label.config(text=view["state"], bg=row_bg,
+                                fg=COLOR_RED_ON if view["stale"] else COLOR_TEXT_DIM)
+        for child in self.head_fields_frame.winfo_children():
+            child.destroy()
+        for n, (title, value) in enumerate(view["head_fields"]):
+            self._field(self.head_fields_frame, title, value, row_bg, n)
         for child in self.fields_frame.winfo_children():
             child.destroy()
         fields = view["fields"]
@@ -2186,11 +2182,13 @@ class AgentRow(tk.Frame):
             line_frame = tk.Frame(self.fields_frame, bg=row_bg)
             line_frame.pack(fill="x", anchor="w")
             for n, idx in enumerate(line):
-                title, value = fields[idx]
-                tk.Label(line_frame, text=title, bg=row_bg, fg=COLOR_TEXT_DIM, font=self._field_font,
-                         padx=0).pack(side="left", padx=(self.FIELD_GAP if n else 0, 3))
-                tk.Label(line_frame, text=value, bg=row_bg, fg=COLOR_TEXT, font=self._field_font,
-                         padx=0).pack(side="left")
+                self._field(line_frame, *fields[idx], row_bg, n)
+
+    def _field(self, parent: tk.Widget, title: str, value: str, bg: str, n: int) -> None:
+        """「見出し 値」の1欄(見出しは薄い色)。2つ目以降は FIELD_GAP 空ける。"""
+        tk.Label(parent, text=title, bg=bg, fg=COLOR_TEXT_DIM, font=self._field_font,
+                 padx=0).pack(side="left", padx=(self.FIELD_GAP if n else 0, 3))
+        tk.Label(parent, text=value, bg=bg, fg=COLOR_TEXT, font=self._field_font, padx=0).pack(side="left")
 
 
 class ClaudeMonitorApp:

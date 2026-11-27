@@ -371,19 +371,19 @@
   .rpa-row:nth-child(even) { background: var(--row-alt-bg); }
   .rpa-row.stale { border-left-color: var(--red-on); background: rgba(255, 77, 79, 0.12); }
   /* 1行目: ランプ・名前・PC名・状態・最終更新を横に並べる(幅が足りなければ折り返す)。2行目: 残りの欄を横に並べる */
-  .rpa-head { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 8px; row-gap: 2px; }
-  .rpa-head .rpa-lamp { align-self: center; }
+  .rpa-head { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 8px; row-gap: 2px; position: relative; padding-left: 20px; }
+  .rpa-head .rpa-lamp { position: absolute; left: 0; top: 5px; }  /* 折り返した行も名前の位置に揃える */
   .rpa-lamp { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; background: var(--text-dim); }
   .rpa-lamp.idle { background: var(--green); }
   .rpa-lamp.busy { background: #ffb020; }
   .rpa-lamp.stale { background: var(--red-on); }
   .rpa-name { font-size: 15px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
-  .rpa-pc { font-size: 11px; color: var(--text-dim); }
   .rpa-sub { color: var(--text-dim); font-size: 12px; }
-  .rpa-row.stale .rpa-updated { color: var(--red-on); font-weight: 600; }
+  .rpa-row.stale .rpa-sub { color: var(--red-on); font-weight: 600; }
   .rpa-fields { display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 1px; margin: 2px 0 0 20px; font-size: 12px; }
-  .rpa-fields span { overflow-wrap: anywhere; }
-  .rpa-fields b { font-weight: 400; color: var(--text-dim); margin-right: 4px; }
+  .rpa-field { font-size: 12px; overflow-wrap: anywhere; }
+  .rpa-field b { font-weight: 400; color: var(--text-dim); margin-right: 4px; }
+  .rpa-head { column-gap: 12px; }
   .setup-panel .error { color: var(--red-on); font-size: 12px; margin: -4px 0 10px; min-height: 1em; }
   [hidden] { display: none !important; }
 </style>
@@ -1201,7 +1201,9 @@ const rpaRowsEl = document.getElementById('rpa-rows');
 const rpaSummaryEl = document.getElementById('rpa-summary');
 const SESSION_VIEW_IDS = ['sessions-header', 'rows'];
 // 欄: [キー, 見出し]。名前・PC・状態・最終更新は見出し行に出すので除く(列の並びはGUI版と同じ)
-const RPA_FIELD_ORDER = [['hope', 'HOPE'], ['sender', '送信元'], ['lock', '占有'], ['command', '実行中'], ['hours', '使用時間'], ['foreground', '前面']];
+// 1行目: 名前(無ければPC名)・状態・使用時間・HOPE、2行目: 送信元・占有・実行中の命令(2026-11-27利用者の指定。値が無くても「-」で出す)
+const RPA_HEAD_FIELDS = [['hours', '使用時間'], ['hope', 'HOPE']];
+const RPA_SUB_FIELDS = [['sender', '送信元'], ['lock', '占有'], ['command', '実行中の命令']];
 let rpaEnabled = false;
 let rpaTimer = null;
 let currentView = 'sessions';
@@ -1254,12 +1256,11 @@ function renderRpaAgents(data) {
   rpaRowsEl.innerHTML = rows.map(r => {
     const named = r.label && r.label !== '-';  // 名前が無いPCはPC名を名前の位置に出す
     const lamp = r.stale ? 'stale' : (r.tag === 'busy' ? 'busy' : (r.tag === 'idle' ? 'idle' : ''));
-    const fields = RPA_FIELD_ORDER.filter(([k]) => r[k] && r[k] !== '-')
-      .map(([k, t]) => `<span><b>${t}</b>${escapeHtml(r[k])}</span>`).join('');
+    const field = ([k, t]) => `<span class="rpa-field"><b>${t}</b>${escapeHtml(r[k] || '-')}</span>`;
     return `<div class="rpa-row${r.stale ? ' stale' : ''}">`
-      + `<div class="rpa-head"><div class="rpa-lamp ${lamp}"></div><span class="rpa-name">${escapeHtml(named ? r.label : (r.pc || '-'))}</span>${named ? `<span class="rpa-pc">${escapeHtml(r.pc || '')}</span>` : ''}`
-      + `<span class="rpa-sub">${escapeHtml(r.state || '-')} ・ <span class="rpa-updated">${escapeHtml(r.updated || '-')}</span></span></div>`
-      + (fields ? `<div class="rpa-fields">${fields}</div>` : '')
+      + `<div class="rpa-head"><div class="rpa-lamp ${lamp}"></div><span class="rpa-name">${escapeHtml(named ? r.label : (r.pc || '-'))}</span>`
+      + `<span class="rpa-sub">${escapeHtml(r.state || '-')}</span>${RPA_HEAD_FIELDS.map(field).join('')}</div>`
+      + `<div class="rpa-fields">${RPA_SUB_FIELDS.map(field).join('')}</div>`
       + '</div>';
   }).join('');
 }

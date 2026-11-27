@@ -30,16 +30,18 @@ PAYLOAD = {"enabled": True, "fresh_sec": 120, "rows": ROWS, "checked_at": "2026-
 class ViewTests(unittest.TestCase):
     def test_row_view(self):
         a, b, c = (cm.agent_row_view(r) for r in ROWS)
-        self.assertEqual((a["name"], a["pc"], a["lamp"], a["stale"]), ("外来", "PC-A", cm.COLOR_GREEN, False))
-        self.assertEqual([t for t, _ in a["fields"]], ["HOPE", "使用時間", "前面"])
-        self.assertEqual((b["name"], b["pc"], b["lamp"]), ("PC-B", "", cm.COLOR_AGENT_BUSY))  # 名前なし→PC名
-        self.assertIn(("実行中", "c1 soap"), b["fields"])
+        self.assertEqual((a["name"], a["state"], a["lamp"], a["stale"]), ("外来", "稼働中(待機)", cm.COLOR_GREEN, False))
+        self.assertEqual(a["head_fields"], [("使用時間", "終日(時間内)"), ("HOPE", "ログアウト")])
+        self.assertEqual(a["fields"], [("送信元", "-"), ("占有", "-"), ("実行中の命令", "-")])  # 値が無くても並びは固定
+        self.assertEqual((b["name"], b["lamp"]), ("PC-B", cm.COLOR_AGENT_BUSY))  # 名前なし→PC名
+        self.assertEqual(b["fields"], [("送信元", "nurse"), ("占有", "-"), ("実行中の命令", "c1 soap")])
         self.assertEqual((c["lamp"], c["stale"]), (cm.COLOR_RED_ON, True))
+        self.assertNotIn("前面", repr(a))  # 前面・最終更新は出さない(利用者の指定)
 
     def test_row_view_missing_fields(self):
         v = cm.agent_row_view({})
-        self.assertEqual((v["name"], v["state"], v["updated"], v["fields"], v["lamp"]),
-                         ("-", "-", "-", [], cm.COLOR_TEXT_DIM))
+        self.assertEqual((v["name"], v["state"], v["lamp"]), ("-", "-", cm.COLOR_TEXT_DIM))
+        self.assertEqual([x for _, x in v["head_fields"] + v["fields"]], ["-"] * 5)
 
     def test_wrap_fields(self):
         self.assertEqual(cm.wrap_agent_fields([], 100, 10), [])
@@ -175,20 +177,21 @@ class AppTabTests(unittest.TestCase):
         self.assertTrue(all(r.winfo_ismapped() for r in self.app._agent_rows.values()))
         self.assertIn("更新停止 1 台", self.app.agent_summary_label.cget("text"))
         stale = self.app._agent_rows["PC-C"]
-        self.assertEqual(stale.updated_label.cget("fg"), cm.COLOR_RED_ON)
         self.assertEqual(stale.cget("bg"), cm.COLOR_AGENT_STALE_BG)
         self.assertEqual(self.app._agent_source.interval_sec, cm.AGENTS_POLL_SEC)
-        # 1行目に名前・PC名・状態・最終更新が横に並び、欄はその下に横並び
+        # 1行目=名前・状態・使用時間・HOPE、2行目=送信元・占有・実行中の命令
         row = self.app._agent_rows["PC-A"]
-        name_y = row.name_label.winfo_y()
-        for w in (row.pc_label, row.state_label, row.updated_label):
-            self.assertEqual(w.master, row.name_label.master)
-            self.assertGreater(w.winfo_x(), row.name_label.winfo_x())
+        self.assertEqual(row.name_label.cget("text"), "外来")
+        self.assertEqual(row.state_label.master, row.name_label.master)
+        self.assertGreater(row.state_label.winfo_x(), row.name_label.winfo_x())
+        head = [w.cget("text") for w in row.head_fields_frame.winfo_children()]
+        self.assertEqual(head, ["使用時間", "終日(時間内)", "HOPE", "ログアウト"])
         lines = row.fields_frame.winfo_children()
-        self.assertEqual(len(lines), 1)  # 3欄が1行に収まる
-        self.assertEqual(len(lines[0].winfo_children()), 6)
-        self.assertFalse(self.app._agent_rows["PC-B"].pc_label.winfo_manager())  # 名前なし→PC名は名前の位置だけ
-        self.assertEqual(name_y, row.name_label.winfo_y())
+        self.assertEqual(len(lines), 1)
+        self.assertEqual([w.cget("text") for w in lines[0].winfo_children()],
+                         ["送信元", "-", "占有", "-", "実行中の命令", "-"])
+        self.assertEqual(self.app._agent_rows["PC-B"].name_label.cget("text"), "PC-B")
+        self.assertEqual(stale.state_label.cget("fg"), cm.COLOR_RED_ON)
         # 1台減ると行も消える
         self.load({**PAYLOAD, "rows": ROWS[:2]})
         self.assertEqual(sorted(self.app._agent_rows), ["PC-A", "PC-B"])
