@@ -41,6 +41,13 @@ class ViewTests(unittest.TestCase):
         self.assertEqual((v["name"], v["state"], v["updated"], v["fields"], v["lamp"]),
                          ("-", "-", "-", [], cm.COLOR_TEXT_DIM))
 
+    def test_wrap_fields(self):
+        self.assertEqual(cm.wrap_agent_fields([], 100, 10), [])
+        self.assertEqual(cm.wrap_agent_fields([30, 30, 30], 110, 10), [[0, 1, 2]])  # ちょうど収まる
+        self.assertEqual(cm.wrap_agent_fields([30, 30, 30], 90, 10), [[0, 1], [2]])
+        self.assertEqual(cm.wrap_agent_fields([200, 20], 100, 10), [[0], [1]])  # 幅を超える欄も1行に置く
+        self.assertEqual(cm.wrap_agent_fields([50, 50], 1, 10), [[0], [1]])
+
     def test_summary(self):
         self.assertEqual(cm.agent_summary(PAYLOAD), ("稼働 2 / 全 3 台 ・ 更新停止 1 台 ・ 20:36:22 時点", True))
         self.assertEqual(cm.agent_summary({}), ("稼働 0 / 全 0 台", False))
@@ -171,6 +178,17 @@ class AppTabTests(unittest.TestCase):
         self.assertEqual(stale.updated_label.cget("fg"), cm.COLOR_RED_ON)
         self.assertEqual(stale.cget("bg"), cm.COLOR_AGENT_STALE_BG)
         self.assertEqual(self.app._agent_source.interval_sec, cm.AGENTS_POLL_SEC)
+        # 1行目に名前・PC名・状態・最終更新が横に並び、欄はその下に横並び
+        row = self.app._agent_rows["PC-A"]
+        name_y = row.name_label.winfo_y()
+        for w in (row.pc_label, row.state_label, row.updated_label):
+            self.assertEqual(w.master, row.name_label.master)
+            self.assertGreater(w.winfo_x(), row.name_label.winfo_x())
+        lines = row.fields_frame.winfo_children()
+        self.assertEqual(len(lines), 1)  # 3欄が1行に収まる
+        self.assertEqual(len(lines[0].winfo_children()), 6)
+        self.assertFalse(self.app._agent_rows["PC-B"].pc_label.winfo_manager())  # 名前なし→PC名は名前の位置だけ
+        self.assertEqual(name_y, row.name_label.winfo_y())
         # 1台減ると行も消える
         self.load({**PAYLOAD, "rows": ROWS[:2]})
         self.assertEqual(sorted(self.app._agent_rows), ["PC-A", "PC-B"])

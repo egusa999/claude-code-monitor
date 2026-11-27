@@ -2111,17 +2111,33 @@ def agent_summary(payload: dict) -> tuple[str, bool]:
     return text, bool(stale or payload.get("error"))
 
 
+def wrap_agent_fields(widths: list[int], avail: int, gap: int) -> list[list[int]]:
+    """欄(幅の一覧)を横に並べ、avail を超えたら次の行へ送る。戻り値は行ごとの欄の添字。1欄が幅を超えてもその行に置く。"""
+    lines: list[list[int]] = []
+    used = 0
+    for i, w in enumerate(widths):
+        if lines and used + gap + w <= avail:
+            lines[-1].append(i)
+            used += gap + w
+        else:
+            lines.append([i])
+            used = w
+    return lines
+
+
 class AgentRow(tk.Frame):
-    """agentタブの1台分(1段目=ランプ+名前+PC名、2段目=状態・最終更新、以下=欄)。"""
+    """agentタブの1台分(1行目=ランプ・名前・PC名・状態・最終更新を横並び、2行目以降=残りの欄を横並び)。"""
+
+    FIELD_GAP = 14
 
     def __init__(self, master: tk.Widget):
         super().__init__(master, bg=COLOR_ROW_BG)
-        self._view: dict | None = None
-        self._bg = ""
+        self._key: tuple | None = None
         self._name_font = tkfont.Font(family="Segoe UI", size=AGENT_NAME_FONT_SIZE, weight="bold")
+        self._field_font = tkfont.Font(family="Segoe UI", size=8)
         self.stale_bar = tk.Frame(self, width=AGENT_STALE_BAR_WIDTH)
         self.inner = tk.Frame(self)
-        self.inner.pack(side="left", fill="both", expand=True, padx=(ROW_PADDING_X - AGENT_STALE_BAR_WIDTH, 8), pady=6)
+        self.inner.pack(side="left", fill="both", expand=True, padx=(ROW_PADDING_X - AGENT_STALE_BAR_WIDTH, 8), pady=4)
         self.stale_bar.place(x=0, y=0, relheight=1.0)
         head = tk.Frame(self.inner)
         head.pack(fill="x")
@@ -2131,21 +2147,19 @@ class AgentRow(tk.Frame):
         self.name_label.pack(side="left")
         self.pc_label = tk.Label(head, font=("Segoe UI", 8), fg=COLOR_TEXT_DIM, anchor="w")
         self.pc_label.pack(side="left", padx=(6, 0))
-        sub = tk.Frame(self.inner)
-        sub.pack(fill="x", padx=(NAME_INDENT, 0))
-        self.state_label = tk.Label(sub, font=("Segoe UI", 9), fg=COLOR_TEXT_DIM, anchor="w")
-        self.state_label.pack(side="left")
-        self.updated_label = tk.Label(sub, font=("Segoe UI", 9), anchor="w")
+        self.state_label = tk.Label(head, font=("Segoe UI", 9), fg=COLOR_TEXT_DIM, anchor="w")
+        self.state_label.pack(side="left", padx=(8, 0))
+        self.updated_label = tk.Label(head, font=("Segoe UI", 9), anchor="w")
         self.updated_label.pack(side="left")
         self.fields_frame = tk.Frame(self.inner)
         self.fields_frame.pack(fill="x", padx=(NAME_INDENT, 0))
-        self.fields_frame.columnconfigure(1, weight=1)
-        self._containers = (self, self.inner, head, sub, self.fields_frame)
+        self._containers = (self, self.inner, head, self.fields_frame)
 
-    def update_data(self, view: dict, bg: str) -> None:
-        if view == self._view and bg == self._bg:
+    def update_data(self, view: dict, bg: str, width: int = WINDOW_WIDTH) -> None:
+        key = (repr(view), bg, width)
+        if key == self._key:
             return  # 変化が無ければ描き直さない(ちらつき防止)
-        self._view, self._bg = view, bg
+        self._key = key
         row_bg = COLOR_AGENT_STALE_BG if view["stale"] else bg
         for w in self._containers:
             w.config(bg=row_bg)
@@ -2155,16 +2169,28 @@ class AgentRow(tk.Frame):
         self.lamp_canvas.create_oval(1, 1, LAMP_SIZE - 2, LAMP_SIZE - 2, fill=view["lamp"], outline="")
         self.name_label.config(text=view["name"], bg=row_bg)
         self.pc_label.config(text=view["pc"], bg=row_bg)
+        if not view["pc"]:
+            self.pc_label.pack_forget()
+        elif not self.pc_label.winfo_manager():
+            self.pc_label.pack(side="left", padx=(6, 0), before=self.state_label)
         self.state_label.config(text=f"{view['state']} ・ ", bg=row_bg)
         self.updated_label.config(text=view["updated"], bg=row_bg,
                                   fg=COLOR_RED_ON if view["stale"] else COLOR_TEXT_DIM)
         for child in self.fields_frame.winfo_children():
             child.destroy()
-        for i, (title, value) in enumerate(view["fields"]):
-            tk.Label(self.fields_frame, text=title, bg=row_bg, fg=COLOR_TEXT_DIM, font=("Segoe UI", 8),
-                     anchor="w").grid(row=i, column=0, sticky="w", padx=(0, 8))
-            tk.Label(self.fields_frame, text=value, bg=row_bg, fg=COLOR_TEXT, font=("Segoe UI", 8),
-                     anchor="w", justify="left").grid(row=i, column=1, sticky="w")
+        fields = view["fields"]
+        measure = self._field_font.measure
+        widths = [measure(f"{t} ") + measure(v) + 4 for t, v in fields]
+        avail = max(width - ROW_PADDING_X * 2 - NAME_INDENT - SCROLLBAR_WIDTH_PX, 1)
+        for line in wrap_agent_fields(widths, avail, self.FIELD_GAP):
+            line_frame = tk.Frame(self.fields_frame, bg=row_bg)
+            line_frame.pack(fill="x", anchor="w")
+            for n, idx in enumerate(line):
+                title, value = fields[idx]
+                tk.Label(line_frame, text=title, bg=row_bg, fg=COLOR_TEXT_DIM, font=self._field_font,
+                         padx=0).pack(side="left", padx=(self.FIELD_GAP if n else 0, 3))
+                tk.Label(line_frame, text=value, bg=row_bg, fg=COLOR_TEXT, font=self._field_font,
+                         padx=0).pack(side="left")
 
 
 class ClaudeMonitorApp:
@@ -2772,7 +2798,9 @@ class ClaudeMonitorApp:
             if widget is None:
                 widget = AgentRow(self.body)
                 self._agent_rows[key] = widget
-            widget.update_data(agent_row_view(data), COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG)
+            width = self._scroll.winfo_width()
+            widget.update_data(agent_row_view(data), COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG,
+                               width if width > 1 else self._width)
             widget.pack(fill="x")
         self._fit_scroll_area()
 
