@@ -91,6 +91,38 @@ class ForegroundClassTests(unittest.TestCase):
             self.assertEqual(rpa_agents.foreground_class(value), "-", value)
 
 
+class ForegroundLabelTests(unittest.TestCase):
+    def test_known_screens(self):
+        cases = {
+            "ThunderRT6FormDC | 利用者認証": "HOPE 利用者認証",
+            "ThunderRT6Main | ExBSecurityManagerI": "HOPE 認証(セキュリティマネージャ)",
+            "ThunderRT6FormDC | エラー - ExBSecurityManager001": "HOPE 認証エラー",
+            "ThunderRT6FormDC | パスワード変更": "HOPE パスワード変更",
+            "ThunderRT6FormDC | HOPE/EGMAIN-GX 患者 山田太郎 12345678": "HOPE 電子カルテ",
+            "IEFrame | http://host/?view&ris_pat_id=12345678": "RIS(IE)",
+            "IEFrame | 何かのページ": "Internet Explorer",
+            "TFMain | 壁カレ4 [C:\\Users\\someone\\AppData]": "壁カレ",
+            "Windows.UI.Core.CoreWindow | スタート": "スタートメニュー",
+            "ApplicationFrameWindow | 設定": "Windowsアプリ",
+        }
+        for value, label in cases.items():
+            self.assertEqual(rpa_agents.foreground_label(value), label, value)
+
+    def test_unknown_falls_back_to_class_only(self):
+        self.assertEqual(rpa_agents.foreground_label("Static | "), "Static")
+        self.assertEqual(rpa_agents.foreground_label("ThunderRT6FormDC | 患者 山田太郎"), "ThunderRT6FormDC")
+        self.assertEqual(rpa_agents.foreground_label("クラス | x"), "-")
+        self.assertEqual(rpa_agents.foreground_label(None), "-")
+        self.assertEqual(rpa_agents.foreground_label(""), "-")
+
+    def test_title_never_leaks(self):
+        secret = "患者 山田太郎 12345678"
+        for cls in ("ThunderRT6FormDC", "IEFrame", "TFMain", "Unknown", "Windows.UI.Core.CoreWindow"):
+            label = rpa_agents.foreground_label(f"{cls} | {secret}")
+            self.assertNotIn("山田", label)
+            self.assertNotIn("12345678", label)
+
+
 class StaleTests(unittest.TestCase):
     def test_boundaries(self):
         iso = lambda sec: (NOW - timedelta(seconds=sec)).isoformat()
@@ -117,7 +149,7 @@ class FetchTests(FakeGuiMixin, unittest.TestCase):
         self.assertEqual(data["fresh_sec"], 120)
         self.assertEqual([c["key"] for c in data["columns"]][:2], ["label", "updated"])
         a, b = data["rows"]
-        self.assertEqual((a["pc"], a["stale"], a["foreground"], a["tag"]), ("PC-A", False, "IEFrame", "idle"))
+        self.assertEqual((a["pc"], a["stale"], a["foreground"], a["tag"]), ("PC-A", False, "RIS(IE)", "idle"))
         self.assertEqual((b["pc"], b["stale"], b["foreground"]), ("PC-B", True, "-"))
         self.assertNotIn("ris_pat_id", json.dumps(data, ensure_ascii=False))
 
@@ -192,9 +224,9 @@ class HttpTests(FakeGuiMixin, unittest.TestCase):
         self.assertEqual(self.get("wrong" * 10)[0], 401)
 
     def test_ok_and_disabled(self):
-        self.gui.AGENTS[:] = [("PC-A", datetime.now().isoformat(), "IEFrame | secret title")]
+        self.gui.AGENTS[:] = [("PC-A", datetime.now().isoformat(), "Unknown | secret title")]
         status, body = self.get(self.TOKEN)
-        self.assertEqual((status, body["rows"][0]["foreground"], body["rows"][0]["stale"]), (200, "IEFrame", False))
+        self.assertEqual((status, body["rows"][0]["foreground"], body["rows"][0]["stale"]), (200, "Unknown", False))
         self.assertNotIn("secret", json.dumps(body))
         rpa_agents.configure(None)
         self.assertEqual(self.get(self.TOKEN), (200, {"enabled": False}))
@@ -218,7 +250,9 @@ class RealDataTests(unittest.TestCase):
         self.assertTrue(data["rows"])
         for row in data["rows"]:
             self.assertNotIn("|", row["foreground"])
-            self.assertTrue(rpa_agents.FOREGROUND_CLASS_PATTERN.match(row["foreground"]) or row["foreground"] == "-")
+            labels = {label for _c, _m, label in rpa_agents.FOREGROUND_RULES}
+            self.assertTrue(row["foreground"] in labels or row["foreground"] == "-"
+                            or rpa_agents.FOREGROUND_CLASS_PATTERN.match(row["foreground"]), row["foreground"])
         self.assertNotIn("http", json.dumps(data))
 
 
