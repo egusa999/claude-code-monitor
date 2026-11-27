@@ -150,7 +150,7 @@ AndroidのChromeで上のURLを開き、「ホーム画面に追加」(または
   (または環境変数 `CLAUDE_MONITOR_RPA_AGENT_DIR`)付きで起動したときだけ出ます。`DIR` は
   `agent_monitor_gui.py` を持つ別のRPAプロジェクトのフォルダで、行の組み立てはそこから import して使います。
   データは `GET /api/agents`(トークン必須)。状態ファイルの更新が止まったPCは赤で表示します。
-  前面の窓はクラス名だけを返し、タイトルやURLは返しません。
+  前面の窓はクラス名だけを返し、タイトルやURLは返しません。デスクトップGUI(リモートモード)にも同じタブがあります。
 
 ### サーバー側の前提(CORS)
 `docs/index.html`は別オリジン(GitHub Pages)からサーバーの`/api/sessions`等をfetchするため、

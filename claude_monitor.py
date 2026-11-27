@@ -1368,15 +1368,42 @@ class RemoteSessionSource:
             return {"error": "サーバーに接続できません"}
 
 
+    def fetch_agents(self) -> dict:
+        """サーバーの`/api/agents`(RPA実機エージェントの稼働一覧)を取得する(呼び出し元のスレッドでブロックする)。
+        古いサーバー(404)・未設定は機能なし(`enabled: False`)として扱う。"""
+        with self._lock:
+            configured = bool(self._base and self._token)
+        if not configured:
+            return {"enabled": False}
+        try:
+            return self._request("/api/agents")
+        except urllib.error.HTTPError as e:
+            if e.code == HTTP_NOT_FOUND:
+                return {"enabled": False}
+            if e.code == HTTP_UNAUTHORIZED:
+                return {"error": "トークンが無効です"}
+            try:
+                return json.load(e)  # 503でも本文にエラー理由が入っている
+            except (OSError, ValueError):
+                return {"error": f"HTTP {e.code}"}
+        except (OSError, ValueError):
+            return {"error": "サーバーに接続できません"}
+
+
 HTTP_UNAUTHORIZED = 401
+HTTP_NOT_FOUND = 404
 USAGE_POLL_SEC = 60.0  # GUIがプラン使用量を取り直す間隔(サーバーがAPIを呼ぶのは5分以上おき。ここは軽いキャッシュ読みのみ)
 
 
 class UsageSource:
     """プラン使用量を別スレッドで周期取得する(ネットワーク待ちでGUIを固めない)。get()は最新結果を返す。"""
 
-    def __init__(self, fetch_fn):
+    def __init__(self, fetch_fn, interval_sec: float = USAGE_POLL_SEC, label: str = "usage",
+                 error_text: str = "使用量を取得できません"):
         self._fetch_fn = fetch_fn
+        self.interval_sec = interval_sec  # 取得間隔(agentタブは表示中だけ短くする)
+        self._label = label
+        self._error_text = error_text
         self._lock = threading.Lock()
         self._usage: dict = {}
         self._wake = threading.Event()
@@ -1390,15 +1417,15 @@ class UsageSource:
             try:
                 usage = self._fetch_fn()
             except Exception as e:  # 取得側のどんな失敗でも周期取得を止めない
-                logging.warning("usage fetch failed: %s", e)
-                usage = {"error": "使用量を取得できません"}
+                logging.warning("%s fetch failed: %s", self._label, e)
+                usage = {"error": self._error_text}
             with self._lock:
                 if "error" in usage and set(usage) == {"error"}:
                     # 失敗しても前回値は残し、エラー表示だけ更新する
                     self._usage = {**{k: v for k, v in self._usage.items() if k != "error"}, **usage}
                 else:
                     self._usage = usage
-            self._wake.wait(USAGE_POLL_SEC)
+            self._wake.wait(self.interval_sec)
             self._wake.clear()
 
     def get(self) -> dict:
@@ -2027,6 +2054,119 @@ class SessionRow(tk.Frame):
             self._draw_lamp()
 
 
+# --- RPA実機エージェントの稼働一覧(「agent」タブ、リモートモードのみ・読み取り専用) ----------------
+# サーバーの /api/agents が有効(enabled)なときだけタブを出す。PWAの「agent」タブと同じ内容。
+# 窓タイトル・URLはサーバーが返さない(PHI対策。前面窓はクラス名だけ)。
+AGENTS_POLL_SEC = 5.0          # agentタブ表示中の取得間隔(RPA側のGUIと同じ)
+AGENTS_IDLE_POLL_SEC = 60.0    # セッション表示中(タブを出すかどうかの確認だけ)
+VIEW_SESSIONS = "sessions"
+VIEW_AGENTS = "agents"
+COLOR_AGENT_BUSY = "#ffb020"
+COLOR_AGENT_STALE_BG = "#3a2230"   # 更新が止まったPCの行の背景(赤み)
+AGENT_NAME_FONT_SIZE = 12
+AGENT_FIELD_LABEL_WIDTH = 64
+AGENT_STALE_BAR_WIDTH = 3
+# 欄: (キー, 見出し)。名前・PC・状態・最終更新は上の段に出すので除く(並びはRPA側GUIと同じ)
+AGENT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("hope", "HOPE"), ("sender", "送信元"), ("lock", "占有"), ("command", "実行中"),
+    ("hours", "使用時間"), ("foreground", "前面"))
+NO_VALUE = "-"
+
+
+def agent_row_view(row: dict) -> dict:
+    """/api/agents の1行を画面表示用にする(ランプ色・名前・PC・2段目・欄の一覧)。"""
+    stale = bool(row.get("stale"))
+    tag = row.get("tag")
+    if stale:
+        lamp = COLOR_RED_ON
+    elif tag == "busy":
+        lamp = COLOR_AGENT_BUSY
+    elif tag == "idle":
+        lamp = COLOR_GREEN
+    else:
+        lamp = COLOR_TEXT_DIM
+    label = str(row.get("label") or NO_VALUE)
+    pc = str(row.get("pc") or "")
+    named = label != NO_VALUE
+    fields = [(title, str(row[key])) for key, title in AGENT_FIELDS
+              if row.get(key) not in (None, "", NO_VALUE)]
+    return {"stale": stale, "lamp": lamp, "name": label if named else (pc or NO_VALUE),
+            "pc": pc if named else "", "state": str(row.get("state") or NO_VALUE),
+            "updated": str(row.get("updated") or NO_VALUE), "fields": fields}
+
+
+def agent_summary(payload: dict) -> tuple[str, bool]:
+    """上部の集計行(文言, エラー/更新停止ありで赤くするか)。"""
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    alive = sum(1 for r in rows if isinstance(r, dict) and r.get("tag") != "stopped")
+    stale = sum(1 for r in rows if isinstance(r, dict) and r.get("stale"))
+    text = f"稼働 {alive} / 全 {len(rows)} 台"
+    if stale:
+        text += f" ・ 更新停止 {stale} 台"
+    checked = str(payload.get("checked_at") or "")
+    if len(checked) >= 19:
+        text += f" ・ {checked[11:19]} 時点"
+    if payload.get("error"):
+        text += f"  {payload['error']}"
+    return text, bool(stale or payload.get("error"))
+
+
+class AgentRow(tk.Frame):
+    """agentタブの1台分(1段目=ランプ+名前+PC名、2段目=状態・最終更新、以下=欄)。"""
+
+    def __init__(self, master: tk.Widget):
+        super().__init__(master, bg=COLOR_ROW_BG)
+        self._view: dict | None = None
+        self._bg = ""
+        self._name_font = tkfont.Font(family="Segoe UI", size=AGENT_NAME_FONT_SIZE, weight="bold")
+        self.stale_bar = tk.Frame(self, width=AGENT_STALE_BAR_WIDTH)
+        self.inner = tk.Frame(self)
+        self.inner.pack(side="left", fill="both", expand=True, padx=(ROW_PADDING_X - AGENT_STALE_BAR_WIDTH, 8), pady=6)
+        self.stale_bar.place(x=0, y=0, relheight=1.0)
+        head = tk.Frame(self.inner)
+        head.pack(fill="x")
+        self.lamp_canvas = tk.Canvas(head, width=LAMP_SIZE, height=LAMP_SIZE, highlightthickness=0)
+        self.lamp_canvas.pack(side="left", padx=(0, LAMP_GAP))
+        self.name_label = tk.Label(head, font=self._name_font, fg=COLOR_TEXT, anchor="w")
+        self.name_label.pack(side="left")
+        self.pc_label = tk.Label(head, font=("Segoe UI", 8), fg=COLOR_TEXT_DIM, anchor="w")
+        self.pc_label.pack(side="left", padx=(6, 0))
+        sub = tk.Frame(self.inner)
+        sub.pack(fill="x", padx=(NAME_INDENT, 0))
+        self.state_label = tk.Label(sub, font=("Segoe UI", 9), fg=COLOR_TEXT_DIM, anchor="w")
+        self.state_label.pack(side="left")
+        self.updated_label = tk.Label(sub, font=("Segoe UI", 9), anchor="w")
+        self.updated_label.pack(side="left")
+        self.fields_frame = tk.Frame(self.inner)
+        self.fields_frame.pack(fill="x", padx=(NAME_INDENT, 0))
+        self.fields_frame.columnconfigure(1, weight=1)
+        self._containers = (self, self.inner, head, sub, self.fields_frame)
+
+    def update_data(self, view: dict, bg: str) -> None:
+        if view == self._view and bg == self._bg:
+            return  # 変化が無ければ描き直さない(ちらつき防止)
+        self._view, self._bg = view, bg
+        row_bg = COLOR_AGENT_STALE_BG if view["stale"] else bg
+        for w in self._containers:
+            w.config(bg=row_bg)
+        self.stale_bar.config(bg=COLOR_RED_ON if view["stale"] else row_bg)
+        self.lamp_canvas.config(bg=row_bg)
+        self.lamp_canvas.delete("all")
+        self.lamp_canvas.create_oval(1, 1, LAMP_SIZE - 2, LAMP_SIZE - 2, fill=view["lamp"], outline="")
+        self.name_label.config(text=view["name"], bg=row_bg)
+        self.pc_label.config(text=view["pc"], bg=row_bg)
+        self.state_label.config(text=f"{view['state']} ・ ", bg=row_bg)
+        self.updated_label.config(text=view["updated"], bg=row_bg,
+                                  fg=COLOR_RED_ON if view["stale"] else COLOR_TEXT_DIM)
+        for child in self.fields_frame.winfo_children():
+            child.destroy()
+        for i, (title, value) in enumerate(view["fields"]):
+            tk.Label(self.fields_frame, text=title, bg=row_bg, fg=COLOR_TEXT_DIM, font=("Segoe UI", 8),
+                     anchor="w").grid(row=i, column=0, sticky="w", padx=(0, 8))
+            tk.Label(self.fields_frame, text=value, bg=row_bg, fg=COLOR_TEXT, font=("Segoe UI", 8),
+                     anchor="w", justify="left").grid(row=i, column=1, sticky="w")
+
+
 class ClaudeMonitorApp:
     def __init__(self, root: tk.Tk, remote: RemoteSessionSource | None = None,
                  ssh_host: str | None = None, native_frame: bool = USE_NATIVE_FRAME,
@@ -2074,8 +2214,17 @@ class ClaudeMonitorApp:
         self._usage_panel = UsagePanel(self.root)
         self._usage_panel.pack(fill="x", pady=(4, 0))
         tk.Frame(self.root, bg=COLOR_BORDER, height=1).pack(fill="x", padx=12)
+        # agentタブ: リモートモードでサーバーが有効と返したときだけ出す
+        self._view = VIEW_AGENTS if self._prefs.get("view") == VIEW_AGENTS else VIEW_SESSIONS
+        self._agents_enabled = False
+        self._agent_rows: dict[str, AgentRow] = {}
+        self._agent_source = (UsageSource(self._remote.fetch_agents, AGENTS_IDLE_POLL_SEC, "agents",
+                                          "agent一覧を取得できません")
+                              if self._remote is not None else None)
+        self._build_view_tabs()
         self._build_header()
         self._build_scroll_area()
+        self.agent_summary_label = tk.Label(self.body, bg=COLOR_BG, font=("Segoe UI", 9), anchor="w")
 
         self.empty_label = tk.Label(
             self.body, text="アクティブなセッションはありません",
@@ -2462,6 +2611,56 @@ class ClaudeMonitorApp:
             return
         logging.info("init project done: %s", name)
 
+    def _build_view_tabs(self) -> None:
+        """「セッション / agent」の切替(PWAのタブと同じ)。有効になるまでは配置しない。"""
+        bar = tk.Frame(self.root, bg=COLOR_BG)
+        self._view_tabs = bar
+        self._view_tab_labels: dict[str, tk.Label] = {}
+        for view, text in ((VIEW_SESSIONS, "セッション"), (VIEW_AGENTS, "agent")):
+            lbl = tk.Label(bar, text=text, font=("Segoe UI", 9), padx=12, pady=2, cursor="hand2",
+                           highlightthickness=1)
+            lbl.pack(side="left", padx=(0, 6))
+            lbl.bind("<Button-1>", lambda e, v=view: self.set_view(v))
+            self._view_tab_labels[view] = lbl
+        self._style_view_tabs()
+
+    def _style_view_tabs(self) -> None:
+        current = self._current_view()
+        for view, lbl in self._view_tab_labels.items():
+            active = view == current
+            lbl.config(bg=COLOR_ACCENT if active else COLOR_TRACK, fg="#ffffff" if active else COLOR_TEXT_DIM,
+                       highlightbackground=COLOR_ACCENT if active else COLOR_BORDER)
+
+    def _current_view(self) -> str:
+        return VIEW_AGENTS if (self._agents_enabled and self._view == VIEW_AGENTS) else VIEW_SESSIONS
+
+    def set_view(self, view: str) -> None:
+        if view not in (VIEW_SESSIONS, VIEW_AGENTS) or view == self._view:
+            return
+        self._view = view
+        self._prefs["view"] = view
+        save_ui_prefs(self._prefs)
+        self._apply_view()
+        self._render(self._last_sessions, self._last_error)
+
+    def _apply_view(self) -> None:
+        """タブの表示有無・見出し・取得間隔を今の状態に合わせる。"""
+        if self._agents_enabled and not self._view_tabs.winfo_manager():
+            self._view_tabs.pack(fill="x", padx=ROW_PADDING_X, pady=(8, 0), before=self._header)
+        elif not self._agents_enabled and self._view_tabs.winfo_manager():
+            self._view_tabs.pack_forget()
+        agents = self._current_view() == VIEW_AGENTS
+        if agents and self._header.winfo_manager():
+            self._header.pack_forget()
+        elif not agents and not self._header.winfo_manager():
+            self._header.pack(fill="x", before=self._scroll_holder)
+        if self._agent_source is not None:
+            interval = AGENTS_POLL_SEC if agents else AGENTS_IDLE_POLL_SEC
+            if self._agent_source.interval_sec != interval:
+                self._agent_source.interval_sec = interval
+                self._agent_source.refresh_now()
+        self._style_view_tabs()
+
     def _build_header(self) -> None:
         header = tk.Frame(self.root, bg=COLOR_BG, height=HEADER_HEIGHT)
         self._header = header
@@ -2497,11 +2696,22 @@ class ClaudeMonitorApp:
         sessions, error = self._current_sessions()
         self._update_kickoff_panel()
         self._usage_panel.update_usage(self._usage_source.get())  # 残り時間・経過率は毎回手元で再計算
+        if self._agent_source is not None:
+            enabled = bool(self._agent_source.get().get("enabled", self._agents_enabled))
+            if enabled != self._agents_enabled:
+                self._agents_enabled = enabled
+                self._apply_view()
         self._render(sessions, error)
         self.root.after(POLL_INTERVAL_MS, self.refresh)
 
     def _render(self, sessions: list[SessionInfo], error: str | None) -> None:
         self._last_sessions, self._last_error = sessions, error
+        if self._current_view() == VIEW_AGENTS:
+            self._render_agents()
+            return
+        self.agent_summary_label.pack_forget()
+        for row in self._agent_rows.values():
+            row.pack_forget()
         visible = sessions
         if error:
             empty_text, empty_fg = error, COLOR_ERROR
@@ -2541,11 +2751,37 @@ class ClaudeMonitorApp:
 
         self._fit_scroll_area()
 
+    def _render_agents(self) -> None:
+        """agentタブ: セッションの行を隠し、RPA実機エージェントの行を並べる。"""
+        payload = self._agent_source.get() if self._agent_source is not None else {}
+        for row in self.rows.values():
+            row.pack_forget()
+        self.empty_label.pack_forget()
+        text, alert = agent_summary(payload)
+        self.agent_summary_label.config(text=text, fg=COLOR_ERROR if alert else COLOR_TEXT_DIM)
+        self.agent_summary_label.pack(fill="x", padx=ROW_PADDING_X, pady=(6, 4))
+        rows = [r for r in (payload.get("rows") or []) if isinstance(r, dict)]
+        keys = [str(r.get("pc") or i) for i, r in enumerate(rows)]
+        for key in list(self._agent_rows):
+            if key not in keys:
+                self._agent_rows.pop(key).destroy()
+        for row in self._agent_rows.values():
+            row.pack_forget()
+        for idx, (key, data) in enumerate(zip(keys, rows)):
+            widget = self._agent_rows.get(key)
+            if widget is None:
+                widget = AgentRow(self.body)
+                self._agent_rows[key] = widget
+            widget.update_data(agent_row_view(data), COLOR_ROW_BG if idx % 2 == 0 else COLOR_ROW_ALT_BG)
+            widget.pack(fill="x")
+        self._fit_scroll_area()
+
     # -- リサイズ・スクロール ---------------------------------------------
 
     def _build_scroll_area(self) -> None:
         """セッション一覧をスクロール可能なCanvasに載せる(高さが足りないとき用)。"""
         holder = tk.Frame(self.root, bg=COLOR_BG)
+        self._scroll_holder = holder
         holder.pack(fill="both", expand=True)
         # 矢印なしのttkスクロールバーは自身では幅が決まらないため、固定幅の枠に入れる
         self._scrollbar_box = tk.Frame(holder, width=SCROLLBAR_WIDTH_PX, bg=COLOR_BG)

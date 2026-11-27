@@ -180,7 +180,8 @@ phone: the server runs `claude-session-ctl` itself.
   that provides `agent_monitor_gui.py`; its row logic is imported, not copied.
   Data comes from `GET /api/agents` (token required). PCs whose status file has
   not been updated recently are shown in red. Only the window class of the
-  foreground window is returned, never its title or URL.
+  foreground window is returned, never its title or URL. The desktop GUI
+  (remote mode) shows the same tab.
 
 ### Server-side prerequisite (CORS)
 Since `docs/index.html` fetches the server's `/api/sessions` etc. from a
