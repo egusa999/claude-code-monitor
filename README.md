@@ -174,6 +174,13 @@ phone: the server runs `claude-session-ctl` itself.
 - **🔔**: notifies you when a session goes from working to idle. It only works
   while the app is open; Android stops background pages, so nothing arrives
   once the app is closed or the screen is off.
+- **agent tab (optional)**: a read-only list of RPA agent PCs, shown only when
+  the server is started with `--rpa-agent-dir DIR` (or the environment variable
+  `CLAUDE_MONITOR_RPA_AGENT_DIR`). `DIR` is the folder of a separate RPA project
+  that provides `agent_monitor_gui.py`; its row logic is imported, not copied.
+  Data comes from `GET /api/agents` (token required). PCs whose status file has
+  not been updated recently are shown in red. Only the window class of the
+  foreground window is returned, never its title or URL.
 
 ### Server-side prerequisite (CORS)
 Since `docs/index.html` fetches the server's `/api/sessions` etc. from a
@@ -354,7 +361,7 @@ After editing `claude_monitor.py` / `claude_monitor_web.py` /
 location `/root/claude_monitor/` and restart the relevant service.
 
 ```bash
-cp claude_monitor_web.py claude_monitor.py daily_kickoff.py /root/claude_monitor/
+cp claude_monitor_web.py claude_monitor.py daily_kickoff.py rpa_agents.py /root/claude_monitor/
 systemctl restart claude-monitor.service
 ```
 

@@ -23,6 +23,7 @@ import argparse
 import hmac
 import json
 import logging
+import os
 import posixpath
 import ssl
 import subprocess
@@ -35,6 +36,7 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import claude_monitor
+import rpa_agents
 from claude_monitor import get_sessions
 
 # 「毎朝4時 Hello送信」スクリプト。同じフォルダに daily_kickoff.py を置くこと。
@@ -1115,6 +1117,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
             status = 503 if set(payload) == {"error"} else 200
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send(status, body, "application/json; charset=utf-8", cors=True)
+        elif self.path == "/api/agents":
+            payload = rpa_agents.fetch_agents()
+            self._send_json(503 if payload.get("enabled") and not payload.get("rows") and "error" in payload else 200, payload)
         elif self.path == "/api/create/bases":
             self._send_json(200, bases_payload())
         elif self.path == "/api/jobs":
@@ -1249,7 +1254,11 @@ def main() -> None:
                          help="コンテキストウィンドウの上限トークン数(既定: 環境変数 "
                               "CLAUDE_CONTEXT_TOKEN_LIMIT、未設定なら1,000,000)。"
                               "/context の表示(例: '96.6k / 1m')の右側の数字に合わせる")
+    parser.add_argument("--rpa-agent-dir", default=os.environ.get(rpa_agents.ENV_AGENT_DIR),
+                         help="RPA実機エージェントのフォルダ(agent_monitor_gui.py がある所)。指定するとPWAに"
+                              f"「agent」タブを出す(既定: 環境変数 {rpa_agents.ENV_AGENT_DIR}、未設定なら無効)")
     args = parser.parse_args()
+    rpa_agents.configure(args.rpa_agent_dir)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")  # journalに残る
 
     if args.context_limit is not None:

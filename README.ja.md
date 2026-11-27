@@ -146,6 +146,11 @@ AndroidのChromeで上のURLを開き、「ホーム画面に追加」(または
 - 作成・終了はサーバー側のジョブで動くので、アプリを閉じても止まりません(進み具合は `/api/jobs`)。
 - **🔔**: セッションが作業中から待機に変わると通知します。アプリを開いている間だけ働きます。
   Androidは裏のページを止めるので、閉じている間や画面が消えている間は届きません。
+- **agentタブ(任意)**: RPA実機エージェントの稼働一覧(読み取り専用)。サーバーを `--rpa-agent-dir DIR`
+  (または環境変数 `CLAUDE_MONITOR_RPA_AGENT_DIR`)付きで起動したときだけ出ます。`DIR` は
+  `agent_monitor_gui.py` を持つ別のRPAプロジェクトのフォルダで、行の組み立てはそこから import して使います。
+  データは `GET /api/agents`(トークン必須)。状態ファイルの更新が止まったPCは赤で表示します。
+  前面の窓はクラス名だけを返し、タイトルやURLは返しません。
 
 ### サーバー側の前提(CORS)
 `docs/index.html`は別オリジン(GitHub Pages)からサーバーの`/api/sessions`等をfetchするため、
@@ -300,7 +305,7 @@ python3 daily_kickoff.py
 編集したら、本番配置場所 `/root/claude_monitor/` へコピーして関連サービスを再起動する。
 
 ```bash
-cp claude_monitor_web.py claude_monitor.py daily_kickoff.py /root/claude_monitor/
+cp claude_monitor_web.py claude_monitor.py daily_kickoff.py rpa_agents.py /root/claude_monitor/
 systemctl restart claude-monitor.service
 ```
 

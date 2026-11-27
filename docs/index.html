@@ -419,6 +419,32 @@
     .hide-btn, .term-btn, .clear-btn, .end-btn { font-size: 12px; padding: 5px 10px; margin-top: 4px; }
     .titlebar button { font-size: 13px; padding: 6px 10px; }
   }
+  /* --- 表示切替タブ(セッション / RPA agent)。agentはサーバーで有効なときだけ出す --- */
+  .view-tabs { display: flex; gap: 6px; padding: 8px 14px 0; }
+  .view-tabs button {
+    padding: 5px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--track);
+    color: var(--text-dim); font-size: 12px; cursor: pointer;
+  }
+  .view-tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .panel > #rpa-rows { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+  .rpa-summary { padding: 8px 14px 6px; font-size: 12px; color: var(--text-dim); }
+  .rpa-summary .rpa-err { color: var(--red-on); margin-left: 6px; }
+  .rpa-row { padding: 10px 14px; font-size: 13px; border-left: 3px solid transparent; }
+  .rpa-row:nth-child(odd) { background: var(--row-bg); }
+  .rpa-row:nth-child(even) { background: var(--row-alt-bg); }
+  .rpa-row.stale { border-left-color: var(--red-on); background: rgba(255, 77, 79, 0.12); }
+  .rpa-head { display: flex; align-items: center; gap: 8px; }
+  .rpa-lamp { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; background: var(--text-dim); }
+  .rpa-lamp.idle { background: var(--green); }
+  .rpa-lamp.busy { background: #ffb020; }
+  .rpa-lamp.stale { background: var(--red-on); }
+  .rpa-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .rpa-pc { font-size: 11px; color: var(--text-dim); }
+  .rpa-sub { margin: 2px 0 0 20px; color: var(--text-dim); font-size: 12px; }
+  .rpa-row.stale .rpa-updated { color: var(--red-on); font-weight: 600; }
+  .rpa-fields { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 10px; row-gap: 1px; margin: 4px 0 0 20px; font-size: 12px; }
+  .rpa-fields dt { color: var(--text-dim); }
+  .rpa-fields dd { margin: 0; overflow-wrap: anywhere; }
   .setup-panel .error { color: var(--red-on); font-size: 12px; margin: -4px 0 10px; min-height: 1em; }
   [hidden] { display: none !important; }
 </style>
@@ -446,7 +472,10 @@
       </div>
       <div class="usage" id="usage"></div>
       <div class="jobs" id="jobs" hidden></div>
-      <div class="header">
+      <div class="view-tabs" id="view-tabs" hidden><button type="button" data-view="sessions" class="active">セッション</button><button type="button" data-view="agents">agent</button></div>
+      <div class="rpa-summary" id="rpa-summary" hidden></div>
+      <div id="rpa-rows" hidden></div>
+      <div class="header" id="sessions-header">
         <span>SESSION</span><span class="h-context">CONTEXT USED</span>
       </div>
       <div id="rows"></div>
@@ -524,6 +553,7 @@ function trimZero(s) { return s.endsWith('.0') ? s.slice(0, -2) : s; }
 
 function showSetup(prefill) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (rpaTimer) { clearInterval(rpaTimer); rpaTimer = null; }
   appEl.hidden = true;
   setupEl.hidden = false;
   setupInput.value = prefill || '';
@@ -627,6 +657,7 @@ function pruneStaleHiddenSessions(sessions) {
 }
 function renderHiddenTray(sessions) {
   pruneStaleHiddenSessions(sessions);
+  if (isRpaView()) { hiddenTrayEl.hidden = true; return; }  // agentタブ表示中は出さない
   const hidden = sessions.filter(s => hiddenSessions.has(s.session_id));
   if (hidden.length === 0) {
     hiddenTrayEl.hidden = true;
@@ -1315,6 +1346,79 @@ function checkFinishedWork(sessions) {
 }
 renderNotifyBtn();
 
+// --- RPA実機エージェントの稼働一覧(「agent」タブ、読み取り専用)。サーバーが --rpa-agent-dir 付きで動いているときだけタブを出す。
+// 窓タイトル・URLはサーバーが返さない(PHI対策。前面窓はクラス名だけ)。
+const VIEW_STORAGE_KEY = 'claudeMonitorView';
+const RPA_POLL_MS = 5000;  // RPA側のGUIと同じ間隔
+const viewTabsEl = document.getElementById('view-tabs');
+const rpaRowsEl = document.getElementById('rpa-rows');
+const rpaSummaryEl = document.getElementById('rpa-summary');
+const SESSION_VIEW_IDS = ['sessions-header', 'rows'];
+// 欄: [キー, 見出し]。名前・PC・状態・最終更新は見出し行に出すので除く(列の並びはGUI版と同じ)
+const RPA_FIELD_ORDER = [['hope', 'HOPE'], ['sender', '送信元'], ['lock', '占有'], ['command', '実行中'], ['hours', '使用時間'], ['foreground', '前面']];
+let rpaEnabled = false;
+let rpaTimer = null;
+let currentView = 'sessions';
+try { if (localStorage.getItem(VIEW_STORAGE_KEY) === 'agents') currentView = 'agents'; } catch (e) { /* ignore */ }
+
+function isRpaView() { return rpaEnabled && currentView === 'agents'; }
+function applyView() {
+  const showAgents = isRpaView();
+  viewTabsEl.hidden = !rpaEnabled;
+  for (const b of viewTabsEl.querySelectorAll('button')) b.classList.toggle('active', b.dataset.view === (showAgents ? 'agents' : 'sessions'));
+  for (const id of SESSION_VIEW_IDS) document.getElementById(id).hidden = showAgents;
+  renderHiddenTray(lastSessions);
+  rpaRowsEl.hidden = !showAgents;
+  rpaSummaryEl.hidden = !showAgents;
+  if (showAgents && !rpaTimer) { refreshRpaAgents(); rpaTimer = setInterval(refreshRpaAgents, RPA_POLL_MS); }
+  if (!showAgents && rpaTimer) { clearInterval(rpaTimer); rpaTimer = null; }
+}
+viewTabsEl.addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-view]');
+  if (!b) return;
+  currentView = b.dataset.view;
+  try { localStorage.setItem(VIEW_STORAGE_KEY, currentView); } catch (err) { /* ignore */ }
+  applyView();
+});
+
+async function refreshRpaAgents() {
+  let data;
+  try {
+    const res = await apiFetch(baseUrl + '/api/agents', { cache: 'no-store' });
+    if (res.status === 404) { rpaEnabled = false; applyView(); return; }  // 古いサーバー
+    data = await res.json();
+  } catch (e) {
+    if (!rpaSummaryEl.hidden) rpaSummaryEl.innerHTML = '<span class="rpa-err">agent一覧を取得できません</span>';
+    return;
+  }
+  const enabled = !!(data && data.enabled);
+  if (enabled !== rpaEnabled) { rpaEnabled = enabled; applyView(); }
+  if (enabled && !rpaRowsEl.hidden) renderRpaAgents(data);
+}
+
+function renderRpaAgents(data) {
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  const alive = rows.filter(r => r.tag !== 'stopped').length;
+  const stale = rows.filter(r => r.stale).length;
+  const checked = data.checked_at ? String(data.checked_at).slice(11, 19) : '';
+  rpaSummaryEl.innerHTML = `稼働 ${alive} / 全 ${rows.length} 台`
+    + (stale ? ` ・ <span class="rpa-err" style="margin:0">更新停止 ${stale} 台</span>` : '')
+    + (checked ? ` ・ ${escapeHtml(checked)} 時点` : '')
+    + (data.error ? `<span class="rpa-err">${escapeHtml(data.error)}</span>` : '');
+  if (!rows.length) { rpaRowsEl.innerHTML = '<div class="rpa-summary">エージェントがありません</div>'; return; }
+  rpaRowsEl.innerHTML = rows.map(r => {
+    const named = r.label && r.label !== '-';  // 名前が無いPCはPC名を名前の位置に出す
+    const lamp = r.stale ? 'stale' : (r.tag === 'busy' ? 'busy' : (r.tag === 'idle' ? 'idle' : ''));
+    const fields = RPA_FIELD_ORDER.filter(([k]) => r[k] && r[k] !== '-')
+      .map(([k, t]) => `<dt>${t}</dt><dd>${escapeHtml(r[k])}</dd>`).join('');
+    return `<div class="rpa-row${r.stale ? ' stale' : ''}">`
+      + `<div class="rpa-head"><div class="rpa-lamp ${lamp}"></div><span class="rpa-name">${escapeHtml(named ? r.label : (r.pc || '-'))}</span>${named ? `<span class="rpa-pc">${escapeHtml(r.pc || '')}</span>` : ''}</div>`
+      + `<div class="rpa-sub">${escapeHtml(r.state || '-')} ・ <span class="rpa-updated">${escapeHtml(r.updated || '-')}</span></div>`
+      + (fields ? `<dl class="rpa-fields">${fields}</dl>` : '')
+      + '</div>';
+  }).join('');
+}
+
 function startApp(url) {
   baseUrl = url;
   currentAddressEl.textContent = url.replace(/^https?:\/\//, '');
@@ -1331,12 +1435,14 @@ function startApp(url) {
   jobs = []; prevWorking.clear(); idleSince.clear();
   refreshJobs();
   pollTimer = setInterval(() => { refresh(); refreshKickoff(); refreshJobs(); }, POLL_INTERVAL_MS);
+  rpaEnabled = false; applyView();
+  refreshRpaAgents();  // 有効かどうか(タブを出すか)をサーバーに聞く
 }
 
 // タブ/ウィンドウが非表示の間はブラウザがsetIntervalを大幅に間引くため、
 // 表示状態に戻ったタイミングで即座に再取得して古い表示のまま放置しない。
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); refreshUsage(false); refreshJobs(); }
+  if (!document.hidden && baseUrl) { refresh(); refreshKickoff(); refreshUsage(false); refreshJobs(); if (rpaTimer) refreshRpaAgents(); }
 });
 
 // 初期化: 保存済みアドレスがあれば自動接続、なければ入力フォームを表示
